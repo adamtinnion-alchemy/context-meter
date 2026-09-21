@@ -8,8 +8,9 @@ import Cocoa
 // whole context, so the bigger a window gets, the more each step costs.
 //
 // The menu bar shows the window you touched most recently. The dropdown lists
-// only windows active in the last few hours, newest first, so old chats never
-// pile up.
+// every window active in the last 36 hours (adjustable), newest first, in a
+// box that scrolls, topped up to ten with older ones when there are fewer.
+// Pinned windows stay at the top however old they get.
 
 // MARK: - Settings
 
@@ -19,8 +20,19 @@ let projectsDir = fmHome.appendingPathComponent(".claude/projects")
 
 let amberAt = 150_000
 let redAt = 250_000
+/// The bar goes idle when nothing has been touched for this long.
 let liveWindowHours = 3.0
-let maxListed = 6
+/// The list never shows fewer than this, if that many windows exist at all.
+let minListed = 10
+/// How many older logs the top-up may open looking for them.
+let topUpLimit = 60
+let listHourChoices: [(hours: Double, title: String)] = [
+    (12, "12 hours"), (24, "24 hours"), (36, "36 hours"), (72, "3 days"), (168, "7 days"),
+]
+var listHours: Double {
+    get { let h = UserDefaults.standard.double(forKey: "listHours"); return h > 0 ? h : 36 }
+    set { UserDefaults.standard.set(newValue, forKey: "listHours") }
+}
 let pollSeconds = 5.0
 
 // MARK: - Plan usage settings
@@ -75,7 +87,7 @@ final class Session {
 
     var name: String {
         if !title.isEmpty { return title }
-        if !lastPrompt.isEmpty { return String(lastPrompt.prefix(40)) }
+        if !lastPrompt.isEmpty { return String(lastPrompt.prefix(80)) }
         return "Untitled"
     }
 
@@ -127,6 +139,94 @@ final class Session {
     }
 }
 
+// MARK: - Which windows are listed
+
+/// A window as the menu shows it: a value copied off the scan queue, so the
+/// main thread never reads a Session mid-parse.
+struct Window {
+    let id: String
+    let name: String
+    let project: String
+    let cwd: String
+    let context: Int
+    let steps: Int
+    let reread: Int
+    let modified: Date
+    var pinned: Bool
+}
+
+enum Pins {
+    static var all: Set<String> {
+        get { Set(UserDefaults.standard.stringArray(forKey: "pinned") ?? []) }
+        set { UserDefaults.standard.set(newValue.sorted(), forKey: "pinned") }
+    }
+    static func toggle(_ id: String) {
+        var p = all
+        if p.remove(id) == nil { p.insert(id) }
+        all = p
+    }
+}
+
+/// Pinned first, then newest first.
+func listOrder(_ a: Window, _ b: Window) -> Bool {
+    if a.pinned != b.pinned { return a.pinned }
+    return a.modified > b.modified
+}
+
+/// Reads the logs on its own queue. A day and a half of windows is tens of
+/// megabytes on first launch, which would freeze the bar if parsed on the
+/// main thread. After that each pass only reads what was appended.
+final class Scanner {
+    private let queue = DispatchQueue(label: "contextmeter.windows", qos: .utility)
+    private var sessions: [String: Session] = [:]
+    private var busy = false
+
+    func refresh(done: @escaping ([Window]) -> Void) {
+        guard !busy else { return }
+        busy = true
+        queue.async {
+            let found = self.scan()
+            DispatchQueue.main.async { self.busy = false; done(found) }
+        }
+    }
+
+    func scan() -> [Window] {
+        let cutoff = Date().addingTimeInterval(-listHours * 3600)
+        let pins = Pins.all
+        var files: [(url: URL, mod: Date)] = []
+        for dir in (try? fm.contentsOfDirectory(at: projectsDir, includingPropertiesForKeys: nil)) ?? [] {
+            let inside = (try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
+            for file in inside where file.pathExtension == "jsonl" {
+                let mod = (try? file.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+                files.append((file, mod))
+            }
+        }
+        files.sort { $0.mod > $1.mod }
+        var kept: [String: Session] = [:]
+        var found: [Window] = []
+        var listed = 0, olderOpened = 0
+        for f in files {
+            let id = f.url.deletingPathExtension().lastPathComponent
+            let pinned = pins.contains(id)
+            // Past the cutoff a window is only there to top the list up to ten.
+            if !pinned && f.mod <= cutoff {
+                if listed >= minListed || olderOpened >= topUpLimit { continue }
+                olderOpened += 1
+            }
+            let s = sessions[f.url.path] ?? Session(url: f.url)
+            kept[f.url.path] = s
+            s.update()
+            guard s.steps > 0 else { continue }
+            if !pinned { listed += 1 }
+            found.append(Window(id: id, name: s.name, project: s.project, cwd: s.cwd, context: s.context,
+                                steps: s.steps, reread: s.reread, modified: s.modified, pinned: pinned))
+        }
+        // Forget windows that have dropped off so memory stays flat.
+        sessions = kept
+        return found.sorted(by: listOrder)
+    }
+}
+
 // MARK: - The real numbers, when a session key is present
 
 /// Claude.ai's own answer: the same `session_usage` / `weekly_usage` pair
@@ -160,7 +260,10 @@ final class ClaudeAPI {
     private(set) var rawBody: [String: Any] = [:]
     private var org: String?
 
-    var hasKey: Bool { Self.readKey() != nil }
+    /// Remembered from the last refresh, never read on the main thread: after
+    /// an update the Keychain stops to ask about the new signature, and a menu
+    /// that waits on that question cannot open.
+    private(set) var hasKey = false
 
     // MARK: Keychain
 
@@ -229,10 +332,11 @@ final class ClaudeAPI {
     }
 
     /// A new key may be a different account, so the organisation is found again.
-    func keyChanged() { org = nil; live = nil; lastError = nil }
+    func keyChanged() { org = nil; live = nil; lastError = nil; hasKey = true }
 
     func refresh() {
-        guard let key = Self.readKey() else { live = nil; lastError = nil; return }
+        guard let key = Self.readKey() else { hasKey = false; live = nil; lastError = nil; return }
+        hasKey = true
         lastError = nil
         guard let org = organisation(key: key) else { return }
         guard let body = get("/organizations/\(org)/usage", key: key) as? [String: Any] else {
@@ -501,7 +605,7 @@ enum Opener {
         return nil
     }
 
-    static func open(_ s: Session) {
+    static func open(_ s: Window) {
         let id = s.id
         guard uuid.firstMatch(in: id, range: NSRange(id.startIndex..., in: id)) != nil else { return }
         var target = OpenIn.current
@@ -610,14 +714,160 @@ func ago(_ date: Date) -> String {
     let mins = Int(Date().timeIntervalSince(date) / 60)
     if mins < 1 { return "now" }
     if mins < 60 { return "\(mins)m ago" }
-    return "\(mins / 60)h ago"
+    if mins < 48 * 60 { return "\(mins / 60)h ago" }
+    return "\(mins / 1440)d ago"
+}
+
+// MARK: - The window list
+//
+// A plain NSMenu cannot scroll a section of itself, so the windows live in one
+// custom view: a scroll view of rows that highlight, open and pin themselves.
+
+final class FlippedView: NSView { override var isFlipped: Bool { true } }
+
+final class WindowRow: NSView {
+    static let height: CGFloat = 40
+    /// Clicks this close to the right edge are the pin, not the row.
+    static let pinZone: CGFloat = 44
+    private(set) var entry: Window
+    var onOpen: ((Window) -> Void)?
+    var onPin: ((Window) -> Void)?
+    var hovered = false { didSet { if hovered != oldValue { restyle() } } }
+    private let highlight = NSVisualEffectView()
+    private let dot = NSTextField(labelWithString: "●")
+    private let title = NSTextField(labelWithString: "")
+    private let detail = NSTextField(labelWithString: "")
+    private let pin = NSImageView()
+
+    init(_ w: Window, width: CGFloat) {
+        entry = w
+        super.init(frame: NSRect(x: 0, y: 0, width: width, height: WindowRow.height))
+        autoresizingMask = [.width]
+        highlight.material = .selection
+        highlight.state = .active
+        highlight.isEmphasized = true
+        highlight.wantsLayer = true
+        highlight.layer?.cornerRadius = 5
+        dot.font = NSFont.menuFont(ofSize: 0)
+        title.font = NSFont.menuFont(ofSize: 0)
+        detail.font = NSFont.menuFont(ofSize: 11)
+        for t in [title, detail] { t.lineBreakMode = .byTruncatingTail; t.maximumNumberOfLines = 1 }
+        for v in [highlight, dot, title, detail, pin] as [NSView] { addSubview(v) }
+        show(w)
+        arrange()
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    func show(_ w: Window) {
+        entry = w
+        dot.textColor = colour(for: w.context)
+        title.stringValue = "\(short(w.context))   \(w.name)"
+        detail.stringValue = "\(w.project) · \(w.steps) steps · \(short(w.reread)) re-read · \(ago(w.modified))"
+        pin.image = NSImage(systemSymbolName: w.pinned ? "pin.fill" : "pin", accessibilityDescription: w.pinned ? "Unpin" : "Pin")
+        toolTip = w.name
+        restyle()
+    }
+
+    private func restyle() {
+        highlight.isHidden = !hovered
+        title.textColor = hovered ? .selectedMenuItemTextColor : .labelColor
+        detail.textColor = hovered ? NSColor.selectedMenuItemTextColor.withAlphaComponent(0.8) : .secondaryLabelColor
+        pin.isHidden = !(hovered || entry.pinned)
+        pin.contentTintColor = hovered ? .selectedMenuItemTextColor : .secondaryLabelColor
+    }
+
+    private func arrange() {
+        let w = bounds.width
+        highlight.frame = NSRect(x: 5, y: 0, width: w - 10, height: WindowRow.height)
+        dot.frame = NSRect(x: 14, y: 19, width: 16, height: 17)
+        title.frame = NSRect(x: 31, y: 19, width: w - 31 - WindowRow.pinZone, height: 17)
+        detail.frame = NSRect(x: 31, y: 4, width: w - 31 - WindowRow.pinZone, height: 14)
+        pin.frame = NSRect(x: w - 32, y: 12, width: 16, height: 16)
+    }
+
+    override func setFrameSize(_ newSize: NSSize) { super.setFrameSize(newSize); arrange() }
+    /// The labels would otherwise swallow the click.
+    override func hitTest(_ point: NSPoint) -> NSView? { frame.contains(point) ? self : nil }
+
+    override func mouseUp(with event: NSEvent) {
+        let p = convert(event.locationInWindow, from: nil)
+        guard bounds.contains(p) else { return }
+        if p.x >= bounds.width - WindowRow.pinZone { onPin?(entry) } else { onOpen?(entry) }
+    }
+}
+
+final class WindowList: NSView {
+    static let width: CGFloat = 420
+    var onOpen: ((Window) -> Void)?
+    var onPin: ((Window) -> Void)?
+    private let scroll = NSScrollView()
+    private let doc = FlippedView()
+    private var rows: [WindowRow] = []
+
+    init(_ windows: [Window], visibleRows: Int) {
+        let h = CGFloat(min(windows.count, visibleRows)) * WindowRow.height
+        super.init(frame: NSRect(x: 0, y: 0, width: WindowList.width, height: h))
+        autoresizingMask = [.width]
+        scroll.frame = bounds
+        scroll.autoresizingMask = [.width, .height]
+        scroll.drawsBackground = false
+        scroll.hasVerticalScroller = true
+        scroll.scrollerStyle = .overlay
+        scroll.verticalScrollElasticity = .none
+        doc.autoresizingMask = [.width]
+        scroll.documentView = doc
+        addSubview(scroll)
+        scroll.contentView.postsBoundsChangedNotifications = true
+        NotificationCenter.default.addObserver(self, selector: #selector(scrolled), name: NSView.boundsDidChangeNotification, object: scroll.contentView)
+        show(windows)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    /// Same rows, new contents: the box must not change height while the menu is open.
+    func show(_ windows: [Window]) {
+        rows.forEach { $0.removeFromSuperview() }
+        doc.frame = NSRect(x: 0, y: 0, width: bounds.width, height: CGFloat(windows.count) * WindowRow.height)
+        rows = windows.enumerated().map { i, w in
+            let r = WindowRow(w, width: bounds.width)
+            r.frame.origin.y = CGFloat(i) * WindowRow.height
+            r.onOpen = { [weak self] in self?.onOpen?($0) }
+            r.onPin = { [weak self] in self?.onPin?($0) }
+            doc.addSubview(r)
+            return r
+        }
+        hover(window?.mouseLocationOutsideOfEventStream)
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window != nil { scroll.flashScrollers() }
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseMoved, .mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self))
+    }
+    override func mouseEntered(with event: NSEvent) { hover(event.locationInWindow) }
+    override func mouseMoved(with event: NSEvent) { hover(event.locationInWindow) }
+    override func mouseExited(with event: NSEvent) { hover(nil) }
+    @objc private func scrolled() { hover(window?.mouseLocationOutsideOfEventStream) }
+
+    /// One row is lit at a time, worked out here rather than per row so it
+    /// stays right when the list scrolls under a still pointer.
+    private func hover(_ inWindow: NSPoint?) {
+        var p: NSPoint?
+        if let q = inWindow, bounds.contains(convert(q, from: nil)) { p = doc.convert(q, from: nil) }
+        for r in rows { r.hovered = p.map { r.frame.contains($0) } ?? false }
+    }
 }
 
 // MARK: - App
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     lazy var item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-    var sessions: [String: Session] = [:]
+    let scanner = Scanner()
+    var windows: [Window] = []
     let usage = Usage()
     let api = ClaudeAPI()
 
@@ -634,7 +884,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.delegate = self
         item.menu = menu
         refresh()
-        Timer.scheduledTimer(withTimeInterval: pollSeconds, repeats: true) { [weak self] _ in self?.refresh() }
+        rescan()
+        Timer.scheduledTimer(withTimeInterval: pollSeconds, repeats: true) { [weak self] _ in self?.rescan() }
         // The plan figures move far more slowly than a window does, and the
         // first scan reads a fortnight of logs, so they get their own slower
         // timer on a background queue rather than riding the 5-second one.
@@ -647,26 +898,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // in tokens, and claude.ai does not need pestering.
         pollLive()
         Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in self?.pollLive() }
-    }
-
-    func liveSessions() -> [Session] {
-        let cutoff = Date().addingTimeInterval(-liveWindowHours * 3600)
-        let dirs = (try? fm.contentsOfDirectory(at: projectsDir, includingPropertiesForKeys: nil)) ?? []
-        var live: [Session] = []
-        for dir in dirs {
-            let files = (try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
-            for file in files where file.pathExtension == "jsonl" {
-                let mod = (try? file.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
-                guard mod > cutoff else { continue }
-                let s = sessions[file.path] ?? Session(url: file)
-                sessions[file.path] = s
-                s.update()
-                if s.steps > 0 { live.append(s) }
+        // `ContextMeter --local --open` drops the menu by itself (for testing).
+        if CommandLine.arguments.contains("--open") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                guard let menu = self?.item.menu, let screen = NSScreen.main?.visibleFrame else { return }
+                NSApp.activate(ignoringOtherApps: true)
+                menu.popUp(positioning: nil, at: NSPoint(x: screen.maxX - 520, y: screen.maxY - 10), in: nil)
             }
         }
-        // Forget windows that have gone quiet so memory stays flat.
-        sessions = sessions.filter { $0.value.modified > cutoff }
-        return live.sorted { $0.modified > $1.modified }
+    }
+
+    func rescan() {
+        scanner.refresh { [weak self] found in
+            self?.windows = found
+            self?.refresh()
+        }
+    }
+
+    /// The window the bar reports: the one touched most recently, if that was
+    /// recent enough to still be work in progress.
+    var current: Window? {
+        guard let w = windows.max(by: { $0.modified < $1.modified }),
+              w.modified > Date().addingTimeInterval(-liveWindowHours * 3600) else { return nil }
+        return w
     }
 
     /// THE BAR. Context size first, because that is the thing you can act on
@@ -675,9 +929,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// "am I about to run out" without opening anything.
     func refresh() {
         guard let button = item.button else { return }
-        let live = liveSessions()
         let title = NSMutableAttributedString()
-        if let current = live.first {
+        if let current {
             title.append(NSAttributedString(string: "● ", attributes: [.foregroundColor: colour(for: current.context)]))
             title.append(NSAttributedString(string: short(current.context)))
         } else {
@@ -702,6 +955,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func pollLive() {
+        if CommandLine.arguments.contains("--local") { return }
         DispatchQueue.global(qos: .utility).async { [weak self] in
             self?.api.refresh()
             DispatchQueue.main.async { self?.refresh() }
@@ -726,21 +980,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(.separator())
         }
 
-        let live = Array(liveSessions().prefix(maxListed))
-        let header = NSMenuItem(title: live.isEmpty ? "No windows active in the last \(Int(liveWindowHours)) hours" : "Live windows", action: nil, keyEquivalent: "")
+        let header = NSMenuItem(title: windows.isEmpty ? "No windows yet" : "Windows", action: nil, keyEquivalent: "")
         header.isEnabled = false
         menu.addItem(header)
-        for s in live {
-            let row = NSMutableAttributedString(string: "● ", attributes: [.foregroundColor: colour(for: s.context)])
-            row.append(NSAttributedString(string: "\(short(s.context))   \(s.name)\n", attributes: [.font: NSFont.menuFont(ofSize: 0)]))
-            row.append(NSAttributedString(
-                string: "     \(s.project) · \(s.steps) steps · \(short(s.reread)) re-read · \(ago(s.modified))",
-                attributes: [.font: NSFont.menuFont(ofSize: 11), .foregroundColor: NSColor.secondaryLabelColor]))
-            let mi = NSMenuItem(title: s.name, action: #selector(openSession(_:)), keyEquivalent: "")
-            mi.target = self
-            mi.representedObject = s
-            mi.attributedTitle = row
-            menu.addItem(mi)
+        if !windows.isEmpty {
+            let list = WindowList(windows, visibleRows: visibleRows())
+            list.onOpen = { w in
+                menu.cancelTracking()
+                DispatchQueue.main.async { Opener.open(w) }
+            }
+            list.onPin = { [weak self, weak list] w in
+                guard let self else { return }
+                Pins.toggle(w.id)
+                let pins = Pins.all
+                self.windows = self.windows.map { var x = $0; x.pinned = pins.contains(x.id); return x }.sorted(by: listOrder)
+                list?.show(self.windows)
+            }
+            let holder = NSMenuItem()
+            holder.view = list
+            menu.addItem(holder)
         }
         menu.addItem(.separator())
         let openIn = NSMenuItem(title: "Open windows in", action: nil, keyEquivalent: "")
@@ -754,6 +1012,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         openIn.submenu = sub
         menu.addItem(openIn)
+        let span = NSMenuItem(title: "Show windows from the last", action: nil, keyEquivalent: "")
+        let spanMenu = NSMenu()
+        for choice in listHourChoices {
+            let c = NSMenuItem(title: choice.title, action: #selector(pickListHours(_:)), keyEquivalent: "")
+            c.target = self
+            c.representedObject = choice.hours
+            c.state = listHours == choice.hours ? .on : .off
+            spanMenu.addItem(c)
+        }
+        span.submenu = spanMenu
+        menu.addItem(span)
         let keyItem = NSMenuItem(title: api.hasKey ? "Update Claude key…" : "Add Claude key…", action: #selector(askForKey), keyEquivalent: "")
         keyItem.target = self
         menu.addItem(keyItem)
@@ -815,8 +1084,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    @objc func openSession(_ sender: NSMenuItem) {
-        if let s = sender.representedObject as? Session { Opener.open(s) }
+    /// Ten rows, fewer on a screen too short to hold them with the rest of the menu.
+    private func visibleRows() -> Int {
+        let screen = NSScreen.main?.visibleFrame.height ?? 900
+        return max(4, min(minListed, Int((screen - 380) / WindowRow.height)))
+    }
+
+    @objc func pickListHours(_ sender: NSMenuItem) {
+        if let h = sender.representedObject as? Double { listHours = h; rescan() }
     }
 
     @objc func pickOpenIn(_ sender: NSMenuItem) {
@@ -887,7 +1162,9 @@ if CommandLine.arguments.contains("--print") {
     while waiter.wait(timeout: .now() + 0.05) == .timedOut {
         RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
     }
-    app.api.refresh()
+    // `--print --local` leaves claude.ai and the Keychain alone: a fresh build
+    // has a new signature, and the Keychain stops to ask about it.
+    if !CommandLine.arguments.contains("--local") { app.api.refresh() }
     let u = app.usage
     print(app.source == .live
           ? "source: claude.ai (accurate)"
@@ -901,8 +1178,8 @@ if CommandLine.arguments.contains("--print") {
     line("7 days", app.weeklyPct, u.weekSpend, u.weekCeiling, app.weeklyResets)
     for m in app.api.live?.scoped ?? [] { print("7d \(m.name)\t\(m.pct)%\tresets in \(until(m.resets))") }
     print("")
-    for s in app.liveSessions().prefix(maxListed) {
-        print("\(short(s.context))\t\(s.steps) steps\t\(short(s.reread)) re-read\t\(s.project)\t\(s.name)")
+    for s in app.scanner.scan() {
+        print("\(s.pinned ? "pin" : "")\t\(short(s.context))\t\(s.steps) steps\t\(short(s.reread)) re-read\t\(ago(s.modified))\t\(s.project)\t\(s.name)")
     }
     exit(0)
 }

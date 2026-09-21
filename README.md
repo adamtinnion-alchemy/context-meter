@@ -14,7 +14,13 @@ A macOS menu bar meter for Claude Code.
   yellow at 50%, orange at 70% and red at 85%.
 
 Click it for progress bars, reset times, any model with its own weekly cap
-(for example Fable), and your live Claude Code windows. Click a window to open
+(for example Fable), and your Claude Code windows. The list holds every window
+used in the last 36 hours, ten rows tall, and scrolls for the rest. With fewer
+than ten in that time it is topped up with older ones. **Show windows from the
+last** changes the 36 hours (12 hours to 7 days). Hover a row and click the pin
+to keep that window at the top for good; click it again to let it go.
+
+Click a window to open
 it: in the Claude app if it is a Claude app session, otherwise resumed in
 Terminal with `claude --resume`. **Open windows in** sets a fixed choice:
 Claude app, Terminal or iTerm (only the ones you have installed are listed).
@@ -59,6 +65,8 @@ estimate and shows "Claude key expired" in the menu. Use **Update Claude key…*
 ```bash
 ~/Applications/ContextMeter.app/Contents/MacOS/ContextMeter --print     # figures as text
 ~/Applications/ContextMeter.app/Contents/MacOS/ContextMeter --setkey    # add a key from Terminal
+./ContextMeter.app/Contents/MacOS/ContextMeter --print --local           # same, without claude.ai or the Keychain
+./ContextMeter.app/Contents/MacOS/ContextMeter --local --open            # drops the menu by itself, for a screenshot
 ./uninstall.sh                                                           # remove everything, including the key
 ```
 
@@ -67,6 +75,9 @@ estimate and shows "Claude key expired" in the menu. Use **Update Claude key…*
 ```bash
 git pull && ./install.sh
 ```
+
+Each build has a new signature, so after an update macOS asks once for your
+login password before the meter may read its key again. Choose **Always Allow**.
 
 ## Licence
 
