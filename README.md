@@ -64,3 +64,7 @@ estimate and shows "Claude key expired" in the menu. Use **Update Claude key…*
 ```bash
 git pull && ./install.sh
 ```
+
+## Licence
+
+MIT. Not affiliated with Anthropic. The claude.ai usage endpoint is undocumented and may change.
