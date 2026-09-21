@@ -14,7 +14,10 @@ A macOS menu bar meter for Claude Code.
   yellow at 50%, orange at 70% and red at 85%.
 
 Click it for progress bars, reset times, any model with its own weekly cap
-(for example Fable), and your live Claude Code windows.
+(for example Fable), and your live Claude Code windows. Click a window to open
+it: in the Claude app if it is a Claude app session, otherwise resumed in
+Terminal with `claude --resume`. **Open windows in** sets a fixed choice:
+Claude app, Terminal or iTerm (only the ones you have installed are listed).
 
 ## Install
 

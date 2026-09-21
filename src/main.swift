@@ -67,6 +67,9 @@ final class Session {
     var title = ""
     var lastPrompt = ""
     var project = ""
+    var cwd = ""
+    /// The Claude Code session id: the log file's name.
+    var id: String { url.deletingPathExtension().lastPathComponent }
 
     init(url: URL) { self.url = url }
 
@@ -105,7 +108,7 @@ final class Session {
             if let p = obj["lastPrompt"] as? String { lastPrompt = p }
         case "assistant":
             if obj["isSidechain"] as? Bool == true { return }
-            if let cwd = obj["cwd"] as? String { project = (cwd as NSString).lastPathComponent }
+            if let c = obj["cwd"] as? String { cwd = c; project = (c as NSString).lastPathComponent }
             guard let msg = obj["message"] as? [String: Any],
                   let usage = msg["usage"] as? [String: Any] else { return }
             let key = (msg["id"] as? String ?? "") + "|" + (obj["requestId"] as? String ?? "")
@@ -449,6 +452,83 @@ final class Usage {
     var hasHistory: Bool { !spend.isEmpty }
 }
 
+// MARK: - Opening a window
+
+/// Where a click on a live window takes you. `auto` opens it in the Claude app
+/// when the app knows the session, otherwise resumes it in Terminal.
+enum OpenIn: String, CaseIterable {
+    case auto, claude, terminal, iterm
+    var title: String {
+        switch self {
+        case .auto: return "Automatic"
+        case .claude: return "Claude app"
+        case .terminal: return "Terminal"
+        case .iterm: return "iTerm"
+        }
+    }
+    var installed: Bool {
+        switch self {
+        case .auto, .terminal: return true
+        case .claude: return NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.anthropic.claudefordesktop") != nil
+        case .iterm: return NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.googlecode.iterm2") != nil
+        }
+    }
+    static var current: OpenIn {
+        get { OpenIn(rawValue: UserDefaults.standard.string(forKey: "openIn") ?? "") ?? .auto }
+        set { UserDefaults.standard.set(newValue.rawValue, forKey: "openIn") }
+    }
+}
+
+enum Opener {
+    static let uuid = try! NSRegularExpression(pattern: "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+    static let desktopStore = fmHome.appendingPathComponent("Library/Application Support/Claude/claude-code-sessions")
+
+    /// The Claude app keeps one record per Code-tab session, naming the log it
+    /// writes. Read fresh on each click: it is a few hundred small files.
+    static func desktopId(for cliId: String) -> String? {
+        guard let accounts = try? fm.contentsOfDirectory(at: desktopStore, includingPropertiesForKeys: nil) else { return nil }
+        for a in accounts {
+            for org in (try? fm.contentsOfDirectory(at: a, includingPropertiesForKeys: nil)) ?? [] {
+                for f in (try? fm.contentsOfDirectory(at: org, includingPropertiesForKeys: nil)) ?? [] where f.pathExtension == "json" {
+                    guard let data = try? Data(contentsOf: f),
+                          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                          obj["cliSessionId"] as? String == cliId,
+                          let local = obj["sessionId"] as? String else { continue }
+                    return local
+                }
+            }
+        }
+        return nil
+    }
+
+    static func open(_ s: Session) {
+        let id = s.id
+        guard uuid.firstMatch(in: id, range: NSRange(id.startIndex..., in: id)) != nil else { return }
+        var target = OpenIn.current
+        if !target.installed { target = .auto }
+        let local = desktopId(for: id)
+        if target == .auto { target = (local != nil && OpenIn.claude.installed) ? .claude : .terminal }
+        switch target {
+        case .claude:
+            // A Code-tab session opens as itself; a terminal session is imported.
+            let link = local.map { "claude://code/continue?session=\($0)" } ?? "claude://resume?session=\(id)"
+            if let url = URL(string: link) { NSWorkspace.shared.open(url) }
+        case .terminal, .iterm:
+            let dir = s.cwd.isEmpty ? NSHomeDirectory() : s.cwd
+            let quoted = "'" + dir.replacingOccurrences(of: "'", with: "'\\''") + "'"
+            let cmd = "cd \(quoted) && claude --resume \(id)"
+            let esc = cmd.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+            let script = target == .iterm
+                ? "tell application \"iTerm\"\nactivate\nset w to (create window with default profile)\ntell current session of w to write text \"\(esc)\"\nend tell"
+                : "tell application \"Terminal\"\nactivate\ndo script \"\(esc)\"\nend tell"
+            var err: NSDictionary?
+            NSAppleScript(source: script)?.executeAndReturnError(&err)
+        case .auto:
+            break
+        }
+    }
+}
+
 // MARK: - Formatting
 
 func short(_ n: Int) -> String {
@@ -656,12 +736,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             row.append(NSAttributedString(
                 string: "     \(s.project) · \(s.steps) steps · \(short(s.reread)) re-read · \(ago(s.modified))",
                 attributes: [.font: NSFont.menuFont(ofSize: 11), .foregroundColor: NSColor.secondaryLabelColor]))
-            let mi = NSMenuItem(title: s.name, action: #selector(noop), keyEquivalent: "")
+            let mi = NSMenuItem(title: s.name, action: #selector(openSession(_:)), keyEquivalent: "")
             mi.target = self
+            mi.representedObject = s
             mi.attributedTitle = row
             menu.addItem(mi)
         }
         menu.addItem(.separator())
+        let openIn = NSMenuItem(title: "Open windows in", action: nil, keyEquivalent: "")
+        let sub = NSMenu()
+        for choice in OpenIn.allCases where choice.installed {
+            let c = NSMenuItem(title: choice.title, action: #selector(pickOpenIn(_:)), keyEquivalent: "")
+            c.target = self
+            c.representedObject = choice.rawValue
+            c.state = OpenIn.current == choice ? .on : .off
+            sub.addItem(c)
+        }
+        openIn.submenu = sub
+        menu.addItem(openIn)
         let keyItem = NSMenuItem(title: api.hasKey ? "Update Claude key…" : "Add Claude key…", action: #selector(askForKey), keyEquivalent: "")
         keyItem.target = self
         menu.addItem(keyItem)
@@ -723,7 +815,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    @objc func openSession(_ sender: NSMenuItem) {
+        if let s = sender.representedObject as? Session { Opener.open(s) }
+    }
+
+    @objc func pickOpenIn(_ sender: NSMenuItem) {
+        if let raw = sender.representedObject as? String, let c = OpenIn(rawValue: raw) { OpenIn.current = c }
+    }
+
     @objc func noop() {}
+}
+
+// `ContextMeter --resolve <session-id>` says where a click would open it (for testing).
+if let i = CommandLine.arguments.firstIndex(of: "--resolve"), i + 1 < CommandLine.arguments.count {
+    let id = CommandLine.arguments[i + 1]
+    let local = Opener.desktopId(for: id)
+    print("preference: \(OpenIn.current.title)")
+    print(local.map { "Claude app record: \($0) -> claude://code/continue?session=\($0)" } ?? "no Claude app record -> Terminal: claude --resume \(id)")
+    exit(0)
 }
 
 // `ContextMeter --windows` lists every usage window claude.ai reports, by key.
