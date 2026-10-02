@@ -16,7 +16,6 @@ import Cocoa
 
 let fm = FileManager.default
 let fmHome = fm.homeDirectoryForCurrentUser
-let projectsDir = fmHome.appendingPathComponent(".claude/projects")
 
 let amberAt = 150_000
 let redAt = 250_000
@@ -54,16 +53,102 @@ let wInput = 1.0, wCacheWrite = 1.25, wCacheRead = 0.1, wOutput = 5.0
 
 /// A session block is five hours from first use.
 let blockHours = 5.0
-/// When the weekly window resets. Learned from claude.ai the first time a key
-/// works and remembered, so the estimate lines up with the real week even
-/// after the key expires. Before that, weeks are counted from a fixed epoch.
-var weekAnchor: Date {
-    let t = UserDefaults.standard.double(forKey: "weekAnchor")
+/// When an account's weekly window resets. Learned from claude.ai the first
+/// time its key works and remembered, so the estimate lines up with the real
+/// week even after the key expires. Before that, weeks are counted from a
+/// fixed epoch.
+func weekAnchor(_ account: String) -> Date {
+    let t = UserDefaults.standard.double(forKey: anchorKey(account))
     return t > 0 ? Date(timeIntervalSince1970: t) : Date(timeIntervalSince1970: 0)
 }
+func anchorKey(_ account: String) -> String { account == Account.main ? "weekAnchor" : "weekAnchor.\(account)" }
 
 let usageCache = fmHome.appendingPathComponent(".claude/context-meter-usage.json")
 let usageConfig = fmHome.appendingPathComponent(".claude/context-meter-config.json")
+
+// MARK: - Accounts
+//
+// TWO CLAUDE ACCOUNTS ON ONE MAC. Claude Code keeps one login per config
+// folder: `~/.claude` by default, and any other folder you point
+// CLAUDE_CONFIG_DIR at (for example `~/.claude-work`). Every `~/.claude-*`
+// folder holding a `.claude.json` is treated as a second account.
+//
+// The folders may share one `projects` folder through a symlink, so a log's
+// location cannot say whose it is. Each folder's `session-env` holds a
+// directory per session it ran, and that is what assigns a log to an account.
+
+struct Account {
+    /// The Keychain account name, and the key for everything stored per account.
+    /// `default` for `~/.claude`, which is what a single-account install always used.
+    static let main = "default"
+    let id: String
+    let dir: URL
+    var isMain: Bool { id == Account.main }
+
+    var name: String {
+        get {
+            let names = UserDefaults.standard.dictionary(forKey: "accountNames") as? [String: String] ?? [:]
+            if let n = names[id], !n.isEmpty { return n }
+            if isMain { return "Main" }
+            let suffix = dir.lastPathComponent.replacingOccurrences(of: ".claude-", with: "")
+            return suffix.prefix(1).uppercased() + suffix.dropFirst()
+        }
+        nonmutating set {
+            var names = UserDefaults.standard.dictionary(forKey: "accountNames") as? [String: String] ?? [:]
+            names[id] = newValue
+            UserDefaults.standard.set(names, forKey: "accountNames")
+        }
+    }
+
+    /// Set on a terminal command so a resumed window stays on its own account.
+    var envPrefix: String {
+        isMain ? "" : "CLAUDE_CONFIG_DIR='" + dir.path.replacingOccurrences(of: "'", with: "'\\''") + "' "
+    }
+
+    static func discover() -> [Account] {
+        var found = [Account(id: main, dir: fmHome.appendingPathComponent(".claude"))]
+        let home = (try? fm.contentsOfDirectory(at: fmHome, includingPropertiesForKeys: nil, options: [])) ?? []
+        for dir in home.sorted(by: { $0.path < $1.path }) where dir.lastPathComponent.hasPrefix(".claude-") {
+            var isDir: ObjCBool = false
+            guard fm.fileExists(atPath: dir.path, isDirectory: &isDir), isDir.boolValue,
+                  fm.fileExists(atPath: dir.appendingPathComponent(".claude.json").path) else { continue }
+            found.append(Account(id: dir.lastPathComponent, dir: dir))
+        }
+        return found
+    }
+
+    /// Every log folder, each real folder once however many accounts link to it.
+    static func projectDirs(_ accounts: [Account]) -> [URL] {
+        var seen = Set<String>(), out: [URL] = []
+        for a in accounts {
+            let p = a.dir.appendingPathComponent("projects")
+            let real = p.resolvingSymlinksInPath().path
+            if fm.fileExists(atPath: real), seen.insert(real).inserted { out.append(p) }
+        }
+        return out
+    }
+
+    /// Session id to account id, for every session a second account ran.
+    /// Anything not listed belongs to the main account.
+    static func owners(_ accounts: [Account]) -> [String: String] {
+        var map: [String: String] = [:]
+        for a in accounts where !a.isMain {
+            for s in (try? fm.contentsOfDirectory(atPath: a.dir.appendingPathComponent("session-env").path)) ?? [] {
+                map[s] = a.id
+            }
+            // A log kept in the account's own, unshared projects folder is its own too.
+            let own = a.dir.appendingPathComponent("projects")
+            if (try? own.resourceValues(forKeys: [.isSymbolicLinkKey]))?.isSymbolicLink != true {
+                for d in (try? fm.contentsOfDirectory(at: own, includingPropertiesForKeys: nil)) ?? [] {
+                    for f in (try? fm.contentsOfDirectory(atPath: d.path)) ?? [] where f.hasSuffix(".jsonl") {
+                        map[String(f.dropLast(6))] = a.id
+                    }
+                }
+            }
+        }
+        return map
+    }
+}
 
 // MARK: - Per-window state, parsed incrementally
 
@@ -153,6 +238,8 @@ struct Window {
     let reread: Int
     let modified: Date
     var pinned: Bool
+    /// Which account ran it.
+    let account: String
 }
 
 enum Pins {
@@ -181,20 +268,21 @@ final class Scanner {
     private var sessions: [String: Session] = [:]
     private var busy = false
 
-    func refresh(done: @escaping ([Window]) -> Void) {
+    func refresh(_ accounts: [Account], done: @escaping ([Window]) -> Void) {
         guard !busy else { return }
         busy = true
         queue.async {
-            let found = self.scan()
+            let found = self.scan(accounts)
             DispatchQueue.main.async { self.busy = false; done(found) }
         }
     }
 
-    func scan() -> [Window] {
+    func scan(_ accounts: [Account]) -> [Window] {
         let cutoff = Date().addingTimeInterval(-listHours * 3600)
         let pins = Pins.all
+        let owners = accounts.count > 1 ? Account.owners(accounts) : [:]
         var files: [(url: URL, mod: Date)] = []
-        for dir in (try? fm.contentsOfDirectory(at: projectsDir, includingPropertiesForKeys: nil)) ?? [] {
+        for dir in Account.projectDirs(accounts).flatMap({ (try? fm.contentsOfDirectory(at: $0, includingPropertiesForKeys: nil)) ?? [] }) {
             let inside = (try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
             for file in inside where file.pathExtension == "jsonl" {
                 let mod = (try? file.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
@@ -219,7 +307,8 @@ final class Scanner {
             guard s.steps > 0 else { continue }
             if !pinned { listed += 1 }
             found.append(Window(id: id, name: s.name, project: s.project, cwd: s.cwd, context: s.context,
-                                steps: s.steps, reread: s.reread, modified: s.modified, pinned: pinned))
+                                steps: s.steps, reread: s.reread, modified: s.modified, pinned: pinned,
+                                account: owners[id] ?? Account.main))
         }
         // Forget windows that have dropped off so memory stays flat.
         sessions = kept
@@ -253,6 +342,9 @@ struct LiveUsage {
 /// the same day it dies.
 final class ClaudeAPI {
     static let keychainService = "com.contextmeter.sessionkey"
+    /// Whose key: the Keychain account name, one per Claude account.
+    let account: String
+    init(account: String = Account.main) { self.account = account }
     private(set) var live: LiveUsage?
     private(set) var lastError: String?
     /// Every window claude.ai returned, by its own key, for rows beyond the two.
@@ -267,11 +359,11 @@ final class ClaudeAPI {
 
     // MARK: Keychain
 
-    static func readKey() -> String? {
+    static func readKey(_ account: String = Account.main) -> String? {
         var q: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: keychainService,
-            kSecAttrAccount as String: "default",
+            kSecAttrAccount as String: account,
             kSecReturnData as String: true,
         ]
         q[kSecMatchLimit as String] = kSecMatchLimitOne
@@ -283,11 +375,11 @@ final class ClaudeAPI {
     }
 
     @discardableResult
-    static func writeKey(_ key: String) -> Bool {
+    static func writeKey(_ key: String, account: String = Account.main) -> Bool {
         let base: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: keychainService,
-            kSecAttrAccount as String: "default",
+            kSecAttrAccount as String: account,
         ]
         SecItemDelete(base as CFDictionary)
         if key.isEmpty { return true }
@@ -335,7 +427,7 @@ final class ClaudeAPI {
     func keyChanged() { org = nil; live = nil; lastError = nil; hasKey = true }
 
     func refresh() {
-        guard let key = Self.readKey() else { hasKey = false; live = nil; lastError = nil; return }
+        guard let key = Self.readKey(account) else { hasKey = false; live = nil; lastError = nil; return }
         hasKey = true
         lastError = nil
         guard let org = organisation(key: key) else { return }
@@ -382,7 +474,7 @@ final class ClaudeAPI {
         // Remember when the real week turns over, so the local estimate keeps
         // the same week boundaries if this key later expires.
         if let wk = weekly.1 {
-            UserDefaults.standard.set(wk.addingTimeInterval(-7 * 24 * 3600).timeIntervalSince1970, forKey: "weekAnchor")
+            UserDefaults.standard.set(wk.addingTimeInterval(-7 * 24 * 3600).timeIntervalSince1970, forKey: anchorKey(account))
         }
         live = LiveUsage(scoped: scoped, sessionPct: session.0, sessionResets: session.1,
                          weeklyPct: weekly.0, weeklyResets: weekly.1, fetched: Date())
@@ -391,8 +483,10 @@ final class ClaudeAPI {
 
 // MARK: - Plan usage, from the same local logs
 
-/// One request's weighted spend, at the moment it happened.
-struct Spend: Codable { let at: Double; let cost: Double }
+/// One request's weighted spend, at the moment it happened, and on whose
+/// account. `a` is nil for the main account, which is all a cache written
+/// before accounts existed holds.
+struct Spend: Codable { let at: Double; let cost: Double; var a: String? = nil }
 
 /// Walks every session log, not just the live ones, and keeps a rolling
 /// fortnight of weighted spend so the 5-hour block and the week can be
@@ -408,7 +502,9 @@ final class Usage {
     private let queue = DispatchQueue(label: "contextmeter.usage")
     private let iso = ISO8601DateFormatter()
 
-    /// Ceilings learned from your own history, never published figures.
+    /// Ceilings learned from your own history, never published figures. Shared
+    /// by every account: a new account has no completed weeks of its own yet,
+    /// and the same person's worst week is the fairest reference it can have.
     private(set) var blockCeiling = 0.0
     private(set) var weekCeiling = 0.0
 
@@ -435,36 +531,41 @@ final class Usage {
     }
 
     /// Rescan on a background queue. `done` fires on the main queue.
-    func refresh(done: @escaping () -> Void) {
+    func refresh(_ accounts: [Account], done: @escaping () -> Void) {
         queue.async { [weak self] in
             guard let self else { return }
-            self.scan()
+            self.scan(accounts)
             DispatchQueue.main.async(execute: done)
         }
     }
 
-    private func scan() {
+    private func scan(_ accounts: [Account]) {
         let horizon = Date().addingTimeInterval(-15 * 24 * 3600)
-        let dirs = (try? fm.contentsOfDirectory(at: projectsDir, includingPropertiesForKeys: nil)) ?? []
-        for dir in dirs {
-            let files = (try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
-            for file in files where file.pathExtension == "jsonl" {
-                let mod = (try? file.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
-                guard mod > horizon else { continue }
-                read(file)
+        let owners = accounts.count > 1 ? Account.owners(accounts) : [:]
+        for root in Account.projectDirs(accounts) {
+            for dir in (try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)) ?? [] {
+                let files = (try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
+                for file in files where file.pathExtension == "jsonl" {
+                    let mod = (try? file.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+                    guard mod > horizon else { continue }
+                    let owner = owners[file.deletingPathExtension().lastPathComponent]
+                    read(file, owner: owner == Account.main ? nil : owner)
+                }
             }
         }
         // A fortnight is plenty: the longest question asked of it is one week.
         let cutoff = horizon.timeIntervalSince1970
         spend.removeAll { $0.at < cutoff }
         if seen.count > 400_000 { seen.removeAll() }   // offsets still guard against double counting
-        learnCeilings()
+        learnCeilings(accounts)
         save()
     }
 
-    private func read(_ url: URL) {
-        let key = url.path
-        let start = offsets[key] ?? 0
+    private func read(_ url: URL, owner: String?) {
+        // Keyed by the real path, so a log reached through two linked
+        // folders is still only counted once.
+        let key = url.resolvingSymlinksInPath().path
+        let start = offsets[key] ?? offsets[url.path] ?? 0
         guard let attrs = try? fm.attributesOfItem(atPath: url.path),
               let size = (attrs[.size] as? NSNumber)?.uint64Value else { return }
         if size < start { offsets[key] = 0; return }
@@ -474,10 +575,10 @@ final class Usage {
         guard let data = try? handle.readToEnd(), let lastNewline = data.lastIndex(of: 0x0A) else { return }
         let complete = data[data.startIndex...lastNewline]
         offsets[key] = start + UInt64(complete.count)
-        for line in complete.split(separator: 0x0A) { parse(Data(line)) }
+        for line in complete.split(separator: 0x0A) { parse(Data(line), owner: owner) }
     }
 
-    private func parse(_ line: Data) {
+    private func parse(_ line: Data, owner: String?) {
         guard let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
               obj["type"] as? String == "assistant",
               obj["isSidechain"] as? Bool != true,
@@ -495,21 +596,25 @@ final class Usage {
             + n("cache_read_input_tokens") * wCacheRead
             + n("output_tokens") * wOutput
         guard cost > 0 else { return }
-        spend.append(Spend(at: at.timeIntervalSince1970, cost: cost))
+        spend.append(Spend(at: at.timeIntervalSince1970, cost: cost, a: owner))
     }
 
     // MARK: Answering
 
-    private func total(from: Date, to: Date = Date()) -> Double {
+    private func mine(_ account: String) -> [Spend] {
+        spend.filter { ($0.a ?? Account.main) == account }
+    }
+
+    private func total(_ account: String, from: Date, to: Date = Date()) -> Double {
         let a = from.timeIntervalSince1970, b = to.timeIntervalSince1970
-        return spend.reduce(0) { $0 + (($1.at >= a && $1.at < b) ? $1.cost : 0) }
+        return mine(account).reduce(0) { $0 + (($1.at >= a && $1.at < b) ? $1.cost : 0) }
     }
 
     /// The current 5-hour block starts at the first activity after the last
     /// gap of five hours or more, floored to the hour, which is how the window
     /// behaves in practice: it opens when you start, not on a wall clock.
-    var blockStart: Date? {
-        let sorted = spend.map(\.at).sorted()
+    func blockStart(_ account: String) -> Date? {
+        let sorted = mine(account).map(\.at).sorted()
         guard var cursor = sorted.last else { return nil }
         for t in sorted.reversed() {
             if cursor - t >= blockHours * 3600 { break }
@@ -520,39 +625,44 @@ final class Usage {
         return Date().timeIntervalSince(start) < blockHours * 3600 ? start : nil
     }
 
-    var blockSpend: Double { blockStart.map { total(from: $0) } ?? 0 }
-    var blockEnds: Date? { blockStart.map { $0.addingTimeInterval(blockHours * 3600) } }
+    func blockSpend(_ account: String) -> Double { blockStart(account).map { total(account, from: $0) } ?? 0 }
+    func blockEnds(_ account: String) -> Date? { blockStart(account).map { $0.addingTimeInterval(blockHours * 3600) } }
 
-    /// The week runs seven days from the anchor, rolled forward to today.
-    var weekStart: Date {
-        var start = weekAnchor
+    /// The week runs seven days from the account's anchor, rolled forward to today.
+    func weekStart(_ account: String) -> Date {
+        var start = weekAnchor(account)
         let week = 7.0 * 24 * 3600
         if start > Date() { return start.addingTimeInterval(-week) }
         while start.addingTimeInterval(week) <= Date() { start = start.addingTimeInterval(week) }
         return start
     }
-    var weekSpend: Double { total(from: weekStart) }
-    var weekEnds: Date { weekStart.addingTimeInterval(7 * 24 * 3600) }
+    func weekSpend(_ account: String) -> Double { total(account, from: weekStart(account)) }
+    func weekEnds(_ account: String) -> Date { weekStart(account).addingTimeInterval(7 * 24 * 3600) }
 
     /// Every COMPLETED block and week in the fortnight, so the reference is
     /// your own worst case rather than a number somebody invented. A partial
     /// window in progress is never allowed to set the ceiling.
-    private func learnCeilings() {
+    private func learnCeilings(_ accounts: [Account]) {
         let week = 7.0 * 24 * 3600, block = blockHours * 3600
-        var weeks: [Double: Double] = [:], blocks: [Double: Double] = [:]
-        let anchor = weekAnchor.timeIntervalSince1970
-        for s in spend {
-            weeks[((s.at - anchor) / week).rounded(.down), default: 0] += s.cost
-            blocks[(s.at / block).rounded(.down), default: 0] += s.cost
+        var wk = 0.0, bl = 0.0
+        for acct in accounts {
+            var weeks: [Double: Double] = [:], blocks: [Double: Double] = [:]
+            let anchor = weekAnchor(acct.id).timeIntervalSince1970
+            for s in mine(acct.id) {
+                weeks[((s.at - anchor) / week).rounded(.down), default: 0] += s.cost
+                blocks[(s.at / block).rounded(.down), default: 0] += s.cost
+            }
+            let liveWeek = ((Date().timeIntervalSince1970 - anchor) / week).rounded(.down)
+            let liveBlock = (Date().timeIntervalSince1970 / block).rounded(.down)
+            wk = max(wk, weeks.filter { $0.key != liveWeek }.values.max() ?? 0)
+            bl = max(bl, blocks.filter { $0.key != liveBlock }.values.max() ?? 0)
         }
-        let liveWeek = ((Date().timeIntervalSince1970 - anchor) / week).rounded(.down)
-        let liveBlock = (Date().timeIntervalSince1970 / block).rounded(.down)
-        weekCeiling = weeks.filter { $0.key != liveWeek }.values.max() ?? 0
-        blockCeiling = blocks.filter { $0.key != liveBlock }.values.max() ?? 0
+        weekCeiling = wk
+        blockCeiling = bl
     }
 
-    var blockPct: Int? { blockCeiling > 0 ? Int((blockSpend / blockCeiling * 100).rounded()) : nil }
-    var weekPct: Int? { weekCeiling > 0 ? Int((weekSpend / weekCeiling * 100).rounded()) : nil }
+    func blockPct(_ account: String) -> Int? { blockCeiling > 0 ? Int((blockSpend(account) / blockCeiling * 100).rounded()) : nil }
+    func weekPct(_ account: String) -> Int? { weekCeiling > 0 ? Int((weekSpend(account) / weekCeiling * 100).rounded()) : nil }
     var hasHistory: Bool { !spend.isEmpty }
 }
 
@@ -605,13 +715,18 @@ enum Opener {
         return nil
     }
 
-    static func open(_ s: Window) {
+    static func open(_ s: Window, account: Account?) {
         let id = s.id
         guard uuid.firstMatch(in: id, range: NSRange(id.startIndex..., in: id)) != nil else { return }
         var target = OpenIn.current
         if !target.installed { target = .auto }
         let local = desktopId(for: id)
-        if target == .auto { target = (local != nil && OpenIn.claude.installed) ? .claude : .terminal }
+        // The Claude app only knows its own login, so another account's window
+        // always resumes in a terminal, on that account.
+        let elsewhere = account.map { !$0.isMain } ?? false
+        if target == .auto || (target == .claude && elsewhere) {
+            target = (local != nil && !elsewhere && OpenIn.claude.installed) ? .claude : .terminal
+        }
         switch target {
         case .claude:
             // A Code-tab session opens as itself; a terminal session is imported.
@@ -620,7 +735,7 @@ enum Opener {
         case .terminal, .iterm:
             let dir = s.cwd.isEmpty ? NSHomeDirectory() : s.cwd
             let quoted = "'" + dir.replacingOccurrences(of: "'", with: "'\\''") + "'"
-            let cmd = "cd \(quoted) && claude --resume \(id)"
+            let cmd = "cd \(quoted) && \(account?.envPrefix ?? "")claude --resume \(id)"
             let esc = cmd.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
             let script = target == .iterm
                 ? "tell application \"iTerm\"\nactivate\nset w to (create window with default profile)\ntell current session of w to write text \"\(esc)\"\nend tell"
@@ -738,9 +853,12 @@ final class WindowRow: NSView {
     private let title = NSTextField(labelWithString: "")
     private let detail = NSTextField(labelWithString: "")
     private let pin = NSImageView()
+    /// The account's name, shown first in the detail line for a second account's window.
+    private let accountTag: String?
 
-    init(_ w: Window, width: CGFloat) {
+    init(_ w: Window, width: CGFloat, tag: String?) {
         entry = w
+        self.accountTag = tag
         super.init(frame: NSRect(x: 0, y: 0, width: width, height: WindowRow.height))
         autoresizingMask = [.width]
         highlight.material = .selection
@@ -762,7 +880,7 @@ final class WindowRow: NSView {
         entry = w
         dot.textColor = colour(for: w.context)
         title.stringValue = "\(short(w.context))   \(w.name)"
-        detail.stringValue = "\(w.project) · \(w.steps) steps · \(short(w.reread)) re-read · \(ago(w.modified))"
+        detail.stringValue = (accountTag.map { "\($0) · " } ?? "") + "\(w.project) · \(w.steps) steps · \(short(w.reread)) re-read · \(ago(w.modified))"
         pin.image = NSImage(systemSymbolName: w.pinned ? "pin.fill" : "pin", accessibilityDescription: w.pinned ? "Unpin" : "Pin")
         toolTip = w.name
         restyle()
@@ -800,11 +918,14 @@ final class WindowList: NSView {
     static let width: CGFloat = 420
     var onOpen: ((Window) -> Void)?
     var onPin: ((Window) -> Void)?
+    /// The account name for a row, or nil for the main account's.
+    var accountTag: (Window) -> String? = { _ in nil }
     private let scroll = NSScrollView()
     private let doc = FlippedView()
     private var rows: [WindowRow] = []
 
-    init(_ windows: [Window], visibleRows: Int) {
+    init(_ windows: [Window], visibleRows: Int, tag: @escaping (Window) -> String?) {
+        self.accountTag = tag
         let h = CGFloat(min(windows.count, visibleRows)) * WindowRow.height
         super.init(frame: NSRect(x: 0, y: 0, width: WindowList.width, height: h))
         autoresizingMask = [.width]
@@ -828,7 +949,7 @@ final class WindowList: NSView {
         rows.forEach { $0.removeFromSuperview() }
         doc.frame = NSRect(x: 0, y: 0, width: bounds.width, height: CGFloat(windows.count) * WindowRow.height)
         rows = windows.enumerated().map { i, w in
-            let r = WindowRow(w, width: bounds.width)
+            let r = WindowRow(w, width: bounds.width, tag: accountTag(w))
             r.frame.origin.y = CGFloat(i) * WindowRow.height
             r.onOpen = { [weak self] in self?.onOpen?($0) }
             r.onPin = { [weak self] in self?.onPin?($0) }
@@ -864,20 +985,59 @@ final class WindowList: NSView {
 
 // MARK: - App
 
+/// One account's plan figures, from claude.ai when its key works and from the
+/// local estimate otherwise.
+struct Plan {
+    let live: Bool
+    let sessionPct: Int?
+    let weeklyPct: Int?
+    let sessionResets: Date?
+    let weeklyResets: Date?
+    let scoped: [(name: String, pct: Int, resets: Date?)]
+    let error: String?
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     lazy var item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     let scanner = Scanner()
     var windows: [Window] = []
     let usage = Usage()
-    let api = ClaudeAPI()
+    var accounts: [Account] = Account.discover()
+    private var apis: [String: ClaudeAPI] = [:]
+    var multi: Bool { accounts.count > 1 }
 
-    /// What the two percentages in the bar are actually measured against.
-    enum Source { case live, estimate }
-    var source: Source { api.live != nil ? .live : .estimate }
-    var sessionPct: Int? { api.live.map(\.sessionPct) ?? usage.blockPct }
-    var weeklyPct: Int? { api.live.map(\.weeklyPct) ?? usage.weekPct }
-    var sessionResets: Date? { api.live?.sessionResets ?? usage.blockEnds }
-    var weeklyResets: Date? { api.live?.weeklyResets ?? usage.weekEnds }
+    override init() {
+        super.init()
+        syncAPIs()
+    }
+
+    func api(_ a: Account) -> ClaudeAPI { apis[a.id] ?? ClaudeAPI(account: a.id) }
+
+    /// A config folder made while the meter runs shows up within the minute.
+    private func syncAPIs() {
+        for a in accounts where apis[a.id] == nil { apis[a.id] = ClaudeAPI(account: a.id) }
+    }
+
+    func plan(_ a: Account) -> Plan {
+        let api = api(a)
+        if let live = api.live {
+            return Plan(live: true, sessionPct: live.sessionPct, weeklyPct: live.weeklyPct,
+                        sessionResets: live.sessionResets, weeklyResets: live.weeklyResets,
+                        scoped: live.scoped, error: nil)
+        }
+        return Plan(live: false, sessionPct: usage.blockPct(a.id), weeklyPct: usage.weekPct(a.id),
+                    sessionResets: usage.blockEnds(a.id), weeklyResets: usage.weekEnds(a.id),
+                    scoped: [], error: api.lastError)
+    }
+
+    var hasPlan: Bool { usage.hasHistory || accounts.contains { api($0).live != nil } }
+
+    /// The letter each account goes by in the bar. Whole names if two letters clash.
+    func barLabels() -> [String: String] {
+        let initials = accounts.map { String($0.name.prefix(1)).uppercased() }
+        let clash = Set(initials).count < initials.count
+        return Dictionary(uniqueKeysWithValues: zip(accounts.map(\.id), clash ? accounts.map(\.name) : initials))
+    }
 
     func applicationDidFinishLaunching(_ note: Notification) {
         let menu = NSMenu()
@@ -889,9 +1049,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // The plan figures move far more slowly than a window does, and the
         // first scan reads a fortnight of logs, so they get their own slower
         // timer on a background queue rather than riding the 5-second one.
-        usage.refresh { [weak self] in self?.refresh() }
+        usage.refresh(accounts) { [weak self] in self?.refresh() }
         Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
-            self?.usage.refresh { self?.refresh() }
+            guard let self else { return }
+            self.usage.refresh(self.accounts) { self.refresh() }
         }
         // The live figures come off the network, so they get their own timer
         // and their own queue. A minute is plenty: these move in percent, not
@@ -909,7 +1070,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func rescan() {
-        scanner.refresh { [weak self] found in
+        scanner.refresh(accounts) { [weak self] found in
             self?.windows = found
             self?.refresh()
         }
@@ -938,26 +1099,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         // COMPACT FOR THE NOTCH: on a notched MacBook, menu bar items that do not
         // fit are hidden. Dots in the bar, gauges only on click.
-        func window(_ label: String, _ pct: Int?) {
-            title.append(NSAttributedString(string: "  |  ", attributes: [.foregroundColor: NSColor.tertiaryLabelColor]))
-            title.append(NSAttributedString(string: "\(label) ", attributes: [.foregroundColor: NSColor.labelColor]))
+        func window(_ label: String, _ pct: Int?, labelColour: NSColor = .labelColor, lead: String = "  |  ") {
+            title.append(NSAttributedString(string: lead, attributes: [.foregroundColor: NSColor.tertiaryLabelColor]))
+            title.append(NSAttributedString(string: "\(label) ", attributes: [.foregroundColor: labelColour]))
             title.append(NSAttributedString(string: "● ", attributes: [.foregroundColor: usageDot(pct)]))
             title.append(NSAttributedString(string: pct.map { "\($0)%" } ?? "–", attributes: [.foregroundColor: NSColor.labelColor]))
         }
-        if usage.hasHistory || api.live != nil {
-            window("5h", sessionPct)
-            window("wk", weeklyPct)
-            if source == .estimate {
-                title.append(NSAttributedString(string: " ~", attributes: [.foregroundColor: NSColor.tertiaryLabelColor]))
+        func estimated() {
+            title.append(NSAttributedString(string: "~", attributes: [.foregroundColor: NSColor.tertiaryLabelColor]))
+        }
+        if hasPlan, multi {
+            // TWO ACCOUNTS: only each one's 5-hour figure fits beside the notch.
+            // The week is not dropped, it moves into the letter: the account's
+            // letter turns orange at 70% of its week and red at 85%, so a week
+            // running out still shows without opening anything.
+            let labels = barLabels()
+            for (i, a) in accounts.enumerated() {
+                let p = plan(a)
+                window(labels[a.id] ?? a.name, p.sessionPct, labelColour: weekLetter(p.weeklyPct), lead: i == 0 ? "  |  " : "   ")
+                if !p.live { estimated() }
             }
+        } else if hasPlan, let a = accounts.first {
+            let p = plan(a)
+            window("5h", p.sessionPct)
+            window("wk", p.weeklyPct)
+            if !p.live { title.append(NSAttributedString(string: " ")); estimated() }
         }
         button.attributedTitle = title
     }
 
     func pollLive() {
         if CommandLine.arguments.contains("--local") { return }
+        accounts = Account.discover()
+        syncAPIs()
+        let all = accounts.map { api($0) }
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            self?.api.refresh()
+            all.forEach { $0.refresh() }
             DispatchQueue.main.async { self?.refresh() }
         }
     }
@@ -966,28 +1143,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.removeAllItems()
 
         // THE TWO PLAN WINDOWS, with what you actually want to know beside
-        // each: how much is gone and when it lifts.
-        if usage.hasHistory || api.live != nil {
-            let planHeader = NSMenuItem(title: "Plan usage", action: nil, keyEquivalent: "")
-            planHeader.isEnabled = false
-            menu.addItem(planHeader)
-            addWindowRow(menu, "5-hour session", sessionPct, until(sessionResets))
-            addWindowRow(menu, "7 days, all models", weeklyPct, until(weeklyResets))
-            for m in api.live?.scoped ?? [] {
-                addWindowRow(menu, "7 days, \(m.name)", m.pct, until(m.resets))
+        // each: how much is gone and when it lifts. One block per account.
+        if hasPlan {
+            for a in accounts {
+                let p = plan(a)
+                let planHeader = NSMenuItem(title: multi ? a.name : "Plan usage", action: nil, keyEquivalent: "")
+                planHeader.isEnabled = false
+                menu.addItem(planHeader)
+                addWindowRow(menu, "5-hour session", p.sessionPct, until(p.sessionResets))
+                addWindowRow(menu, "7 days, all models", p.weeklyPct, until(p.weeklyResets))
+                for m in p.scoped {
+                    addWindowRow(menu, "7 days, \(m.name)", m.pct, until(m.resets))
+                }
+                addFootnote(menu, p.error)
+                menu.addItem(.separator())
             }
-            addFootnote(menu)
-            menu.addItem(.separator())
         }
 
         let header = NSMenuItem(title: windows.isEmpty ? "No windows yet" : "Windows", action: nil, keyEquivalent: "")
         header.isEnabled = false
         menu.addItem(header)
         if !windows.isEmpty {
-            let list = WindowList(windows, visibleRows: visibleRows())
-            list.onOpen = { w in
+            let names = Dictionary(uniqueKeysWithValues: accounts.map { ($0.id, $0.name) })
+            // Only the second account's windows are named: most rows are the
+            // main account, and a name on every one of them is noise.
+            let list = WindowList(windows, visibleRows: visibleRows()) { $0.account == Account.main ? nil : names[$0.account] }
+            list.onOpen = { [weak self] w in
                 menu.cancelTracking()
-                DispatchQueue.main.async { Opener.open(w) }
+                let account = self?.accounts.first { $0.id == w.account }
+                DispatchQueue.main.async { Opener.open(w, account: account) }
             }
             list.onPin = { [weak self, weak list] w in
                 guard let self else { return }
@@ -1023,9 +1207,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         span.submenu = spanMenu
         menu.addItem(span)
-        let keyItem = NSMenuItem(title: api.hasKey ? "Update Claude key…" : "Add Claude key…", action: #selector(askForKey), keyEquivalent: "")
-        keyItem.target = self
-        menu.addItem(keyItem)
+        for a in accounts {
+            let which = multi ? a.name : "Claude"
+            let keyItem = NSMenuItem(title: api(a).hasKey ? "Update \(which) key…" : "Add \(which) key…", action: #selector(askForKey(_:)), keyEquivalent: "")
+            keyItem.target = self
+            keyItem.representedObject = a.id
+            menu.addItem(keyItem)
+        }
         menu.addItem(NSMenuItem(title: "Quit ContextMeter", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
     }
 
@@ -1033,8 +1221,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// is reading and what to do if it is the weaker one. ClaudeMeter's whole
     /// failure was a screen that looked fine while being wrong.
     /// Only speaks when something is wrong: colour explains the rest. A dead key is the one thing colour cannot say.
-    private func addFootnote(_ menu: NSMenu) {
-        guard let err = api.lastError else { return }
+    private func addFootnote(_ menu: NSMenu, _ error: String?) {
+        guard let err = error else { return }
         let note = NSMenuItem(title: "", action: nil, keyEquivalent: "")
         note.isEnabled = false
         note.attributedTitle = NSAttributedString(
@@ -1057,25 +1245,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// ADD THE KEY WITHOUT A TERMINAL. A secure field, so the key never shows
     /// on screen, straight into the Keychain. "Open claude.ai" takes you to the
-    /// page the key comes from.
-    @objc func askForKey() {
+    /// page the key comes from. With two accounts the same dialog also names
+    /// the account, since the name is what the bar and the menu go by.
+    @objc func askForKey(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String,
+              let account = accounts.first(where: { $0.id == id }) else { return }
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
-        alert.messageText = "Claude key"
+        alert.messageText = multi ? "\(account.name) key" : "Claude key"
         alert.informativeText = "claude.ai › Developer tools › Application › Cookies › sessionKey"
         let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
         field.placeholderString = "sk-ant-sid…"
-        alert.accessoryView = field
+        let nameField = NSTextField(frame: NSRect(x: 0, y: 32, width: 320, height: 24))
+        nameField.stringValue = account.name
+        nameField.placeholderString = "Name"
+        if multi {
+            let box = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 56))
+            box.addSubview(nameField)
+            box.addSubview(field)
+            alert.accessoryView = box
+        } else {
+            alert.accessoryView = field
+        }
         alert.addButton(withTitle: "Save")
         alert.addButton(withTitle: "Cancel")
         alert.addButton(withTitle: "Open claude.ai")
         alert.window.initialFirstResponder = field
         switch alert.runModal() {
         case .alertFirstButtonReturn:
+            let name = nameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            if multi, !name.isEmpty, name != account.name { account.name = name; refresh() }
             let key = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !key.isEmpty else { return }
-            ClaudeAPI.writeKey(key)
-            api.keyChanged()
+            ClaudeAPI.writeKey(key, account: account.id)
+            api(account).keyChanged()
             pollLive()
         case .alertThirdButtonReturn:
             NSWorkspace.shared.open(URL(string: "https://claude.ai")!)
@@ -1084,10 +1287,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    /// Ten rows, fewer on a screen too short to hold them with the rest of the menu.
+    /// Ten rows, fewer on a screen too short to hold them with the rest of the
+    /// menu, which grows by a block for each extra account.
     private func visibleRows() -> Int {
         let screen = NSScreen.main?.visibleFrame.height ?? 900
-        return max(4, min(minListed, Int((screen - 380) / WindowRow.height)))
+        let plans = CGFloat(accounts.count - 1) * 160
+        return max(4, min(minListed, Int((screen - 380 - plans) / WindowRow.height)))
     }
 
     @objc func pickListHours(_ sender: NSMenuItem) {
@@ -1101,18 +1306,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func noop() {}
 }
 
+/// An account's letter in the bar carries its week: plain until 70%, then
+/// orange, then red at 85%, the same steps as the dots.
+func weekLetter(_ pct: Int?) -> NSColor {
+    guard let pct else { return .labelColor }
+    if pct >= 85 { return .systemRed }
+    if pct >= 70 { return .systemOrange }
+    return .labelColor
+}
+
+/// The account a command line names: by its name, or by its folder
+/// (`work` finds `~/.claude-work`). No name means the main account.
+func pickAccount(after flag: String) -> Account? {
+    let accounts = Account.discover()
+    guard let i = CommandLine.arguments.firstIndex(of: flag), i + 1 < CommandLine.arguments.count,
+          !CommandLine.arguments[i + 1].hasPrefix("--") else { return accounts.first }
+    let want = CommandLine.arguments[i + 1].lowercased()
+    return accounts.first {
+        $0.name.lowercased() == want || $0.id.lowercased() == want
+            || $0.dir.lastPathComponent.lowercased() == ".claude-\(want)"
+            || ($0.isMain && ["main", "default", ".claude"].contains(want))
+    }
+}
+
 // `ContextMeter --resolve <session-id>` says where a click would open it (for testing).
 if let i = CommandLine.arguments.firstIndex(of: "--resolve"), i + 1 < CommandLine.arguments.count {
     let id = CommandLine.arguments[i + 1]
     let local = Opener.desktopId(for: id)
+    let accounts = Account.discover()
+    let owner = Account.owners(accounts)[id].flatMap { o in accounts.first { $0.id == o } }
     print("preference: \(OpenIn.current.title)")
+    if let owner, !owner.isMain {
+        print("account: \(owner.name) -> Terminal: \(owner.envPrefix)claude --resume \(id)")
+        exit(0)
+    }
     print(local.map { "Claude app record: \($0) -> claude://code/continue?session=\($0)" } ?? "no Claude app record -> Terminal: claude --resume \(id)")
     exit(0)
 }
 
-// `ContextMeter --windows` lists every usage window claude.ai reports, by key.
+// `ContextMeter --windows [account]` lists every usage window claude.ai reports, by key.
 if CommandLine.arguments.contains("--windows") {
-    let api = ClaudeAPI(); api.refresh()
+    guard let account = pickAccount(after: "--windows") else { print("No such account."); exit(1) }
+    let api = ClaudeAPI(account: account.id); api.refresh()
     if let e = api.lastError { print(e) }
     if CommandLine.arguments.contains("--raw"),
        let d = try? JSONSerialization.data(withJSONObject: api.rawBody, options: [.prettyPrinted, .sortedKeys]),
@@ -1123,24 +1358,28 @@ if CommandLine.arguments.contains("--windows") {
     exit(0)
 }
 
-// `ContextMeter --setkey` stores a claude.ai session key in the Keychain.
+// `ContextMeter --setkey [account]` stores a claude.ai session key in the Keychain.
 //
 // A PROMPT, NOT AN ARGUMENT. Passing a credential on the command line writes it
 // into the shell history and into every process listing on the machine; typing
 // it at a prompt does neither. The value is pasted by you,
 // it goes straight to the Keychain, and nothing echoes it back.
 if CommandLine.arguments.contains("--setkey") {
-    print("Paste your claude.ai session key (sessionKey cookie), or blank to remove it.")
+    guard let account = pickAccount(after: "--setkey") else {
+        print("No such account. Accounts: " + Account.discover().map(\.name).joined(separator: ", "))
+        exit(1)
+    }
+    print("Paste the claude.ai session key (sessionKey cookie) for \(account.name), or blank to remove it.")
     print("Safari or Chrome: claude.ai, Developer tools, Application, Cookies, sessionKey.")
     print("key: ", terminator: "")
     let entered = (readLine() ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
     if entered.isEmpty {
-        ClaudeAPI.writeKey("")
+        ClaudeAPI.writeKey("", account: account.id)
         print("Removed. ContextMeter falls back to the local estimate.")
         exit(0)
     }
-    guard ClaudeAPI.writeKey(entered) else { print("Could not write to the Keychain."); exit(1) }
-    let api = ClaudeAPI()
+    guard ClaudeAPI.writeKey(entered, account: account.id) else { print("Could not write to the Keychain."); exit(1) }
+    let api = ClaudeAPI(account: account.id)
     api.refresh()
     if let live = api.live {
         print("Stored and working: 5-hour \(live.sessionPct)%, 7 days \(live.weeklyPct)%.")
@@ -1156,7 +1395,7 @@ if CommandLine.arguments.contains("--setkey") {
 if CommandLine.arguments.contains("--print") {
     let app = AppDelegate()
     let waiter = DispatchSemaphore(value: 0)
-    app.usage.refresh { waiter.signal() }
+    app.usage.refresh(app.accounts) { waiter.signal() }
     // The scan runs on its own queue and calls back on the main one, which is
     // not running yet in this mode, so pump it until the callback lands.
     while waiter.wait(timeout: .now() + 0.05) == .timedOut {
@@ -1164,22 +1403,28 @@ if CommandLine.arguments.contains("--print") {
     }
     // `--print --local` leaves claude.ai and the Keychain alone: a fresh build
     // has a new signature, and the Keychain stops to ask about it.
-    if !CommandLine.arguments.contains("--local") { app.api.refresh() }
+    if !CommandLine.arguments.contains("--local") { app.accounts.forEach { app.api($0).refresh() } }
     let u = app.usage
-    print(app.source == .live
-          ? "source: claude.ai (accurate)"
-          : "source: local estimate\(app.api.lastError.map { " (" + $0 + ")" } ?? "") · add a key with --setkey")
-    func line(_ label: String, _ pct: Int?, _ spent: Double, _ ceiling: Double, _ ends: Date?) {
-        let p = pct.map { "\($0)%" } ?? "no reference yet"
-        let ref = app.source == .live ? "" : "\t\(short(Int(spent))) of about \(short(Int(ceiling)))"
-        print("\(label)\t\(p)\(ref)\tresets in \(until(ends))")
+    for a in app.accounts {
+        let p = app.plan(a)
+        if app.multi { print("== \(a.name)  (\(a.dir.path))") }
+        print(p.live
+              ? "source: claude.ai (accurate)"
+              : "source: local estimate\(p.error.map { " (" + $0 + ")" } ?? "") · add a key with --setkey\(a.isMain ? "" : " " + a.name.lowercased())")
+        func line(_ label: String, _ pct: Int?, _ spent: Double, _ ceiling: Double, _ ends: Date?) {
+            let pc = pct.map { "\($0)%" } ?? "no reference yet"
+            let ref = p.live ? "" : "\t\(short(Int(spent))) of about \(short(Int(ceiling)))"
+            print("\(label)\t\(pc)\(ref)\tresets in \(until(ends))")
+        }
+        line("5-hour", p.sessionPct, u.blockSpend(a.id), u.blockCeiling, p.sessionResets)
+        line("7 days", p.weeklyPct, u.weekSpend(a.id), u.weekCeiling, p.weeklyResets)
+        for m in p.scoped { print("7d \(m.name)\t\(m.pct)%\tresets in \(until(m.resets))") }
+        print("")
     }
-    line("5-hour", app.sessionPct, u.blockSpend, u.blockCeiling, app.sessionResets)
-    line("7 days", app.weeklyPct, u.weekSpend, u.weekCeiling, app.weeklyResets)
-    for m in app.api.live?.scoped ?? [] { print("7d \(m.name)\t\(m.pct)%\tresets in \(until(m.resets))") }
-    print("")
-    for s in app.scanner.scan() {
-        print("\(s.pinned ? "pin" : "")\t\(short(s.context))\t\(s.steps) steps\t\(short(s.reread)) re-read\t\(ago(s.modified))\t\(s.project)\t\(s.name)")
+    let names = Dictionary(uniqueKeysWithValues: app.accounts.map { ($0.id, $0.name) })
+    for s in app.scanner.scan(app.accounts) {
+        let who = app.multi ? "\(names[s.account] ?? s.account)\t" : ""
+        print("\(s.pinned ? "pin" : "")\t\(who)\(short(s.context))\t\(s.steps) steps\t\(short(s.reread)) re-read\t\(ago(s.modified))\t\(s.project)\t\(s.name)")
     }
     exit(0)
 }

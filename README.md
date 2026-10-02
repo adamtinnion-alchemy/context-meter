@@ -25,6 +25,28 @@ it: in the Claude app if it is a Claude app session, otherwise resumed in
 Terminal with `claude --resume`. **Open windows in** sets a fixed choice:
 Claude app, Terminal or iTerm (only the ones you have installed are listed).
 
+## Two accounts
+
+Claude Code keeps one login per config folder: `~/.claude`, plus any folder you
+point `CLAUDE_CONFIG_DIR` at. ContextMeter picks up every `~/.claude-*` folder
+with a `.claude.json` in it (for example `~/.claude-work`) as a second account.
+
+```
+● 146k  |  P ● 16%   W ● 0%
+```
+
+With two accounts the bar shows each account's 5-hour figure behind its
+initial. An initial turns orange when that account has used 70% of its week
+and red at 85%. Click for each account's full figures. Windows from the second
+account are named in the list, and clicking one resumes it on that account.
+
+Each account takes its own key: **Add Work key…** and so on. The same dialog
+renames the account. From Terminal, `--setkey work` names the account by its
+name or folder.
+
+The folders may share one `projects` folder through a symlink. A window is
+assigned to an account by the folder whose `session-env` holds its session.
+
 ## Install
 
 Needs macOS 12 or later and the Xcode Command Line Tools
@@ -54,7 +76,7 @@ estimate and shows "Claude key expired" in the menu. Use **Update Claude key…*
 
 ## Privacy
 
-- Reads `~/.claude/projects/*/*.jsonl` locally. Nothing from your logs leaves
+- Reads `~/.claude/projects/*/*.jsonl` (and any second account's) locally. Nothing from your logs leaves
   the machine.
 - The only network call is claude.ai's own usage endpoint, and only when you
   have added a key.
@@ -64,7 +86,7 @@ estimate and shows "Claude key expired" in the menu. Use **Update Claude key…*
 
 ```bash
 ~/Applications/ContextMeter.app/Contents/MacOS/ContextMeter --print     # figures as text
-~/Applications/ContextMeter.app/Contents/MacOS/ContextMeter --setkey    # add a key from Terminal
+~/Applications/ContextMeter.app/Contents/MacOS/ContextMeter --setkey    # add a key from Terminal (--setkey work for a second account)
 ./ContextMeter.app/Contents/MacOS/ContextMeter --print --local           # same, without claude.ai or the Keychain
 ./ContextMeter.app/Contents/MacOS/ContextMeter --local --open            # drops the menu by itself, for a screenshot
 ./uninstall.sh                                                           # remove everything, including the key
