@@ -65,6 +65,10 @@ func anchorKey(_ account: String) -> String { account == Account.main ? "weekAnc
 
 let usageCache = fmHome.appendingPathComponent(".claude/context-meter-usage.json")
 let usageConfig = fmHome.appendingPathComponent(".claude/context-meter-config.json")
+/// The bar's latest claude.ai figures, percentages only, never a key. Other
+/// tools (`--json`, Switchboard) read this instead of the Keychain, so only
+/// the menu bar app ever asks the Keychain for anything.
+let liveCache = fmHome.appendingPathComponent(".claude/context-meter-live.json")
 
 // MARK: - Accounts
 //
@@ -356,6 +360,9 @@ final class ClaudeAPI {
     /// an update the Keychain stops to ask about the new signature, and a menu
     /// that waits on that question cannot open.
     private(set) var hasKey = false
+    /// Read from the Keychain once per launch, not once a minute: each read
+    /// is a chance for macOS to ask for the password again.
+    private var cachedKey: String?
 
     // MARK: Keychain
 
@@ -424,10 +431,11 @@ final class ClaudeAPI {
     }
 
     /// A new key may be a different account, so the organisation is found again.
-    func keyChanged() { org = nil; live = nil; lastError = nil; hasKey = true }
+    func keyChanged() { org = nil; live = nil; lastError = nil; hasKey = true; cachedKey = nil }
 
     func refresh() {
-        guard let key = Self.readKey(account) else { hasKey = false; live = nil; lastError = nil; return }
+        guard let key = cachedKey ?? Self.readKey(account) else { hasKey = false; live = nil; lastError = nil; return }
+        cachedKey = key
         hasKey = true
         lastError = nil
         guard let org = organisation(key: key) else { return }
@@ -1135,8 +1143,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let all = accounts.map { api($0) }
         DispatchQueue.global(qos: .utility).async { [weak self] in
             all.forEach { $0.refresh() }
-            DispatchQueue.main.async { self?.refresh() }
+            DispatchQueue.main.async { self?.writeLiveCache(); self?.refresh() }
         }
+    }
+
+    func writeLiveCache() {
+        func stamp(_ d: Date?) -> Any { d.map { $0.timeIntervalSince1970 } ?? NSNull() }
+        var out: [String: Any] = [:]
+        for a in accounts {
+            guard let l = api(a).live else { continue }
+            out[a.id] = ["fiveHourPct": l.sessionPct, "fiveHourResets": stamp(l.sessionResets),
+                         "weekPct": l.weeklyPct, "weekResets": stamp(l.weeklyResets),
+                         "scoped": l.scoped.map { ["name": $0.name, "pct": $0.pct, "resets": stamp($0.resets)] },
+                         "fetched": l.fetched.timeIntervalSince1970]
+        }
+        if let data = try? JSONSerialization.data(withJSONObject: out) { try? data.write(to: liveCache, options: .atomic) }
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
@@ -1393,8 +1414,8 @@ if CommandLine.arguments.contains("--setkey") {
 
 // `ContextMeter --print` lists live windows as text and exits (for testing).
 // `--json` is one JSON object for other local tools (Switchboard) to read:
-// accounts with their plan figures (claude.ai's own where a key is stored),
-// then windows. `--json --local` keeps to the local estimate.
+// accounts with their plan figures (claude.ai's own, from the running bar's
+// cache), then windows. `--json --local` keeps to the local estimate.
 if CommandLine.arguments.contains("--json") {
     let app = AppDelegate()
     let waiter = DispatchSemaphore(value: 0)
@@ -1402,13 +1423,22 @@ if CommandLine.arguments.contains("--json") {
     while waiter.wait(timeout: .now() + 0.05) == .timedOut {
         RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
     }
-    // The real figures, from claude.ai with each account's stored key, the
-    // same ones the bar shows. `--local` skips them and keeps the estimate.
-    if !CommandLine.arguments.contains("--local") {
-        DispatchQueue.concurrentPerform(iterations: app.accounts.count) { i in app.api(app.accounts[i]).refresh() }
+    // The real figures, as the running menu bar app last fetched them from
+    // claude.ai. Read from its cache file, never the Keychain, so this never
+    // prompts. Older than five minutes (bar not running) means the estimate.
+    var cached: [String: [String: Any]] = [:]
+    if !CommandLine.arguments.contains("--local"), let d = try? Data(contentsOf: liveCache),
+       let j = try? JSONSerialization.jsonObject(with: d) as? [String: [String: Any]] {
+        cached = j.filter { (($0.value["fetched"] as? Double) ?? 0) > Date().timeIntervalSince1970 - 300 }
     }
     func stamp(_ d: Date?) -> Any { d.map { $0.timeIntervalSince1970 } ?? NSNull() }
     let accounts: [[String: Any]] = app.accounts.map { a in
+        if let c = cached[a.id] {
+            return ["id": a.id, "name": a.name, "dir": a.dir.path, "main": a.isMain, "live": true,
+                    "fiveHourPct": c["fiveHourPct"] ?? NSNull(), "fiveHourResets": c["fiveHourResets"] ?? NSNull(),
+                    "weekPct": c["weekPct"] ?? NSNull(), "weekResets": c["weekResets"] ?? NSNull(),
+                    "scoped": c["scoped"] ?? [], "error": NSNull()]
+        }
         let p = app.plan(a)
         return ["id": a.id, "name": a.name, "dir": a.dir.path, "main": a.isMain, "live": p.live,
                 "fiveHourPct": p.sessionPct.map { $0 as Any } ?? NSNull(), "fiveHourResets": stamp(p.sessionResets),
