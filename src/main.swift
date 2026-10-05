@@ -1392,8 +1392,9 @@ if CommandLine.arguments.contains("--setkey") {
 }
 
 // `ContextMeter --print` lists live windows as text and exits (for testing).
-// `--json` is `--print --local` as one JSON object, for other local tools
-// (Switchboard) to read: accounts with their plan figures, then windows.
+// `--json` is one JSON object for other local tools (Switchboard) to read:
+// accounts with their plan figures (claude.ai's own where a key is stored),
+// then windows. `--json --local` keeps to the local estimate.
 if CommandLine.arguments.contains("--json") {
     let app = AppDelegate()
     let waiter = DispatchSemaphore(value: 0)
@@ -1401,12 +1402,19 @@ if CommandLine.arguments.contains("--json") {
     while waiter.wait(timeout: .now() + 0.05) == .timedOut {
         RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
     }
+    // The real figures, from claude.ai with each account's stored key, the
+    // same ones the bar shows. `--local` skips them and keeps the estimate.
+    if !CommandLine.arguments.contains("--local") {
+        DispatchQueue.concurrentPerform(iterations: app.accounts.count) { i in app.api(app.accounts[i]).refresh() }
+    }
     func stamp(_ d: Date?) -> Any { d.map { $0.timeIntervalSince1970 } ?? NSNull() }
     let accounts: [[String: Any]] = app.accounts.map { a in
         let p = app.plan(a)
         return ["id": a.id, "name": a.name, "dir": a.dir.path, "main": a.isMain, "live": p.live,
                 "fiveHourPct": p.sessionPct.map { $0 as Any } ?? NSNull(), "fiveHourResets": stamp(p.sessionResets),
-                "weekPct": p.weeklyPct.map { $0 as Any } ?? NSNull(), "weekResets": stamp(p.weeklyResets)]
+                "weekPct": p.weeklyPct.map { $0 as Any } ?? NSNull(), "weekResets": stamp(p.weeklyResets),
+                "scoped": p.scoped.map { ["name": $0.name, "pct": $0.pct, "resets": stamp($0.resets)] },
+                "error": p.error.map { $0 as Any } ?? NSNull()]
     }
     let windows: [[String: Any]] = app.scanner.scan(app.accounts).map { s in
         ["id": s.id, "name": s.name, "project": s.project, "cwd": s.cwd, "context": s.context,
