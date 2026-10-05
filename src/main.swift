@@ -1392,6 +1392,32 @@ if CommandLine.arguments.contains("--setkey") {
 }
 
 // `ContextMeter --print` lists live windows as text and exits (for testing).
+// `--json` is `--print --local` as one JSON object, for other local tools
+// (Switchboard) to read: accounts with their plan figures, then windows.
+if CommandLine.arguments.contains("--json") {
+    let app = AppDelegate()
+    let waiter = DispatchSemaphore(value: 0)
+    app.usage.refresh(app.accounts) { waiter.signal() }
+    while waiter.wait(timeout: .now() + 0.05) == .timedOut {
+        RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
+    }
+    func stamp(_ d: Date?) -> Any { d.map { $0.timeIntervalSince1970 } ?? NSNull() }
+    let accounts: [[String: Any]] = app.accounts.map { a in
+        let p = app.plan(a)
+        return ["id": a.id, "name": a.name, "dir": a.dir.path, "main": a.isMain, "live": p.live,
+                "fiveHourPct": p.sessionPct.map { $0 as Any } ?? NSNull(), "fiveHourResets": stamp(p.sessionResets),
+                "weekPct": p.weeklyPct.map { $0 as Any } ?? NSNull(), "weekResets": stamp(p.weeklyResets)]
+    }
+    let windows: [[String: Any]] = app.scanner.scan(app.accounts).map { s in
+        ["id": s.id, "name": s.name, "project": s.project, "cwd": s.cwd, "context": s.context,
+         "steps": s.steps, "reread": s.reread, "modified": s.modified.timeIntervalSince1970,
+         "pinned": s.pinned, "account": s.account]
+    }
+    let data = try! JSONSerialization.data(withJSONObject: ["accounts": accounts, "windows": windows])
+    FileHandle.standardOutput.write(data)
+    exit(0)
+}
+
 if CommandLine.arguments.contains("--print") {
     let app = AppDelegate()
     let waiter = DispatchSemaphore(value: 0)
