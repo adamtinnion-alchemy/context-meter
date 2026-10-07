@@ -62,8 +62,12 @@ This builds the app, puts it in `~/Applications`, and starts it at login.
 
 ## Exact plan figures
 
-Without a key the plan figures are an estimate from your local Claude Code
-logs, marked with a trailing `~`. For claude.ai's own figures:
+The plan figures are exact with no setup: the meter asks each account's own
+`claude` program (`claude -p /usage`, no model call, so it costs nothing) every
+few minutes. Only if that fails does it show an estimate from your local logs,
+marked with a trailing `~`.
+
+A claude.ai key is optional and refreshes every minute instead:
 
 1. In Chrome, open claude.ai signed in to the account you want to track.
 2. Cmd+Option+I, then **Application**, **Cookies**, **https://claude.ai**.
@@ -72,14 +76,14 @@ logs, marked with a trailing `~`. For claude.ai's own figures:
 
 The key is stored in your macOS Keychain and never written to a file. If it
 expires (for example you log out of claude.ai), the meter falls back to the
-estimate and shows "Claude key expired" in the menu. Use **Update Claude key…**.
+`claude` program's figures. Use **Update Claude key…**.
 
 ## Privacy
 
 - Reads `~/.claude/projects/*/*.jsonl` (and any second account's) locally. Nothing from your logs leaves
   the machine.
-- The only network call is claude.ai's own usage endpoint, and only when you
-  have added a key.
+- The only network calls are claude.ai's own usage endpoint, when you have
+  added a key, and the `claude` program's own usage check.
 - Cache: `~/.claude/context-meter-usage.json`.
 
 ## Commands

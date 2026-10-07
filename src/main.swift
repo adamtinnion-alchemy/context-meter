@@ -36,10 +36,11 @@ let pollSeconds = 5.0
 
 // MARK: - Plan usage settings
 //
-// TWO SOURCES. With a claude.ai session key (menu: Add Claude key…) the bar
-// shows claude.ai's own figures. Without one, or when the key expires, it
-// falls back to an estimate from the local Claude Code logs, so it never goes
-// blank, and marks that with a trailing `~`.
+// THREE SOURCES. With a claude.ai session key (menu: Add Claude key…) the bar
+// shows claude.ai's own figures. Without one, or when the key expires, it asks
+// the account's own `claude` program (`claude -p /usage`), which is just as
+// exact. Only if both fail does it fall back to an estimate from the local
+// Claude Code logs, so it never goes blank, and marks that with a trailing `~`.
 //
 // The estimate cannot know the real ceiling, which Anthropic does not publish,
 // so its percentages are against a ceiling learned from your own history:
@@ -348,7 +349,9 @@ final class ClaudeAPI {
     static let keychainService = "com.contextmeter.sessionkey"
     /// Whose key: the Keychain account name, one per Claude account.
     let account: String
-    init(account: String = Account.main) { self.account = account }
+    /// The account's Claude Code config folder, nil for `~/.claude`.
+    let configDir: URL?
+    init(account: String = Account.main, configDir: URL? = nil) { self.account = account; self.configDir = configDir }
     private(set) var live: LiveUsage?
     private(set) var lastError: String?
     /// Every window claude.ai returned, by its own key, for rows beyond the two.
@@ -363,6 +366,9 @@ final class ClaudeAPI {
     /// Read from the Keychain once per launch, not once a minute: each read
     /// is a chance for macOS to ask for the password again.
     private var cachedKey: String?
+    private var lastCLI: Date?
+    /// Whether the figures on show came from the `claude` program rather than claude.ai.
+    private(set) var fromCLI = false
 
     // MARK: Keychain
 
@@ -433,8 +439,102 @@ final class ClaudeAPI {
     /// A new key may be a different account, so the organisation is found again.
     func keyChanged() { org = nil; live = nil; lastError = nil; hasKey = true; cachedKey = nil }
 
+    /// claude.ai first, where a key is stored and still works. Otherwise the
+    /// account's own `claude` program, which needs no key and cannot go stale.
     func refresh() {
-        guard let key = cachedKey ?? Self.readKey(account) else { hasKey = false; live = nil; lastError = nil; return }
+        let before = live?.fetched
+        // `--cli` leaves claude.ai and the Keychain alone (for testing a fresh build).
+        if !CommandLine.arguments.contains("--cli") { refreshFromKey() }
+        if live?.fetched == before { refreshFromCLI() }
+        // A figure nobody has confirmed for ten minutes is not shown as current.
+        if let l = live, Date().timeIntervalSince(l.fetched) > 600 { live = nil }
+    }
+
+    private static let cliPath: String? = {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        return [home + "/.local/bin/claude", "/opt/homebrew/bin/claude", "/usr/local/bin/claude", home + "/.claude/local/claude"]
+            .first { FileManager.default.isExecutableFile(atPath: $0) }
+    }()
+
+    /// `claude -p /usage` answers from the account's own login without a model
+    /// call, so it costs nothing. Run with no settings and no saved session, so
+    /// no hooks fire and no window appears in the list.
+    private func refreshFromCLI() {
+        if let at = lastCLI, Date().timeIntervalSince(at) < 170 { return }
+        guard let bin = Self.cliPath else { return }
+        lastCLI = Date()
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: bin)
+        p.arguments = ["-p", "/usage", "--output-format", "json", "--no-session-persistence",
+                       "--strict-mcp-config", "--setting-sources", ""]
+        var env = ["HOME": FileManager.default.homeDirectoryForCurrentUser.path, "USER": NSUserName(),
+                   "PATH": "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin"]
+        if let configDir { env["CLAUDE_CONFIG_DIR"] = configDir.path }
+        p.environment = env
+        p.currentDirectoryURL = FileManager.default.temporaryDirectory
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = FileHandle.nullDevice
+        p.standardInput = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 40) { if p.isRunning { p.terminate() } }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        guard let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let text = j["result"] as? String, let usage = Self.parseUsage(text) else { return }
+        if let wk = usage.weeklyResets {
+            UserDefaults.standard.set(wk.addingTimeInterval(-7 * 24 * 3600).timeIntervalSince1970, forKey: anchorKey(account))
+        }
+        live = usage
+        fromCLI = true
+        lastError = nil
+    }
+
+    /// Lines such as `Current week (all models): 35% used · resets Oct 10 at 6pm (Europe/London)`.
+    static func parseUsage(_ text: String, now: Date = Date()) -> LiveUsage? {
+        let line = try! NSRegularExpression(pattern: #"^Current (session|week)(?: \(([^)]+)\))?: (\d+)% used(?: · resets (.+?)(?: \(([^)]+)\))?)?\s*$"#, options: [.anchorsMatchLines])
+        var session: (Int, Date?)?
+        var week: (Int, Date?)?
+        var scoped: [(name: String, pct: Int, resets: Date?)] = []
+        let ns = text as NSString
+        for m in line.matches(in: text, range: NSRange(location: 0, length: ns.length)) {
+            func g(_ i: Int) -> String? { m.range(at: i).location == NSNotFound ? nil : ns.substring(with: m.range(at: i)) }
+            guard let kind = g(1), let pct = g(3).flatMap({ Int($0) }) else { continue }
+            let resets = g(4).flatMap { resetDate($0, zone: g(5), now: now) }
+            if kind == "session" { session = (pct, resets) }
+            else if let scope = g(2), scope != "all models" { scoped.append((scope, pct, resets)) }
+            else { week = (pct, resets) }
+        }
+        guard let session, let week else { return nil }
+        return LiveUsage(scoped: scoped, sessionPct: session.0, sessionResets: session.1,
+                         weeklyPct: week.0, weeklyResets: week.1, fetched: now)
+    }
+
+    /// `Oct 10 at 6pm`, `Oct 7 at 1:30pm`, or a bare `6pm` for later today.
+    static func resetDate(_ s: String, zone: String?, now: Date) -> Date? {
+        let tz = zone.flatMap { TimeZone(identifier: $0) } ?? .current
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = tz
+        f.dateFormat = "yyyy MMM d"
+        let today = f.string(from: now)
+        let year = String(today.prefix(4))
+        let clean = s.replacingOccurrences(of: "am", with: "AM").replacingOccurrences(of: "pm", with: "PM")
+        for (prefix, format, dated) in [(year + " ", "MMM d 'at' h:mma", true), (year + " ", "MMM d 'at' ha", true),
+                                        (today + " ", "h:mma", false), (today + " ", "ha", false)] {
+            f.dateFormat = "yyyy " + (dated ? "" : "MMM d ") + format
+            guard var d = f.date(from: prefix + clean) else { continue }
+            var cal = Calendar(identifier: .gregorian)
+            cal.timeZone = tz
+            if dated, d < now.addingTimeInterval(-86400) { d = cal.date(byAdding: .year, value: 1, to: d) ?? d }
+            if !dated, d < now { d = cal.date(byAdding: .day, value: 1, to: d) ?? d }
+            return d
+        }
+        return nil
+    }
+
+    private func refreshFromKey() {
+        guard let key = cachedKey ?? Self.readKey(account) else { hasKey = false; lastError = nil; return }
         cachedKey = key
         hasKey = true
         lastError = nil
@@ -486,6 +586,7 @@ final class ClaudeAPI {
         }
         live = LiveUsage(scoped: scoped, sessionPct: session.0, sessionResets: session.1,
                          weeklyPct: weekly.0, weeklyResets: weekly.1, fetched: Date())
+        fromCLI = false
     }
 }
 
@@ -1019,11 +1120,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         syncAPIs()
     }
 
-    func api(_ a: Account) -> ClaudeAPI { apis[a.id] ?? ClaudeAPI(account: a.id) }
+    func api(_ a: Account) -> ClaudeAPI { apis[a.id] ?? ClaudeAPI(account: a.id, configDir: a.isMain ? nil : a.dir) }
 
     /// A config folder made while the meter runs shows up within the minute.
     private func syncAPIs() {
-        for a in accounts where apis[a.id] == nil { apis[a.id] = ClaudeAPI(account: a.id) }
+        for a in accounts where apis[a.id] == nil { apis[a.id] = ClaudeAPI(account: a.id, configDir: a.isMain ? nil : a.dir) }
     }
 
     func plan(_ a: Account) -> Plan {
@@ -1425,11 +1526,11 @@ if CommandLine.arguments.contains("--json") {
     }
     // The real figures, as the running menu bar app last fetched them from
     // claude.ai. Read from its cache file, never the Keychain, so this never
-    // prompts. Older than five minutes (bar not running) means the estimate.
+    // prompts. Older than ten minutes (bar not running) means the estimate.
     var cached: [String: [String: Any]] = [:]
     if !CommandLine.arguments.contains("--local"), let d = try? Data(contentsOf: liveCache),
        let j = try? JSONSerialization.jsonObject(with: d) as? [String: [String: Any]] {
-        cached = j.filter { (($0.value["fetched"] as? Double) ?? 0) > Date().timeIntervalSince1970 - 300 }
+        cached = j.filter { (($0.value["fetched"] as? Double) ?? 0) > Date().timeIntervalSince1970 - 600 }
     }
     func stamp(_ d: Date?) -> Any { d.map { $0.timeIntervalSince1970 } ?? NSNull() }
     let accounts: [[String: Any]] = app.accounts.map { a in
@@ -1473,7 +1574,7 @@ if CommandLine.arguments.contains("--print") {
         let p = app.plan(a)
         if app.multi { print("== \(a.name)  (\(a.dir.path))") }
         print(p.live
-              ? "source: claude.ai (accurate)"
+              ? "source: \(app.api(a).fromCLI ? "claude program" : "claude.ai") (accurate)"
               : "source: local estimate\(p.error.map { " (" + $0 + ")" } ?? "") · add a key with --setkey\(a.isMain ? "" : " " + a.name.lowercased())")
         func line(_ label: String, _ pct: Int?, _ spent: Double, _ ceiling: Double, _ ends: Date?) {
             let pc = pct.map { "\($0)%" } ?? "no reference yet"
