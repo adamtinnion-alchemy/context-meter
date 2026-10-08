@@ -608,6 +608,9 @@ final class Usage {
     private var offsets: [String: UInt64] = [:]
     private var seen = Set<String>()
     private var spend: [Spend] = []
+    /// What the main thread answers from. `spend` belongs to the queue while a
+    /// scan is appending to it, so readers get the copy published when it ends.
+    private var shown: [Spend] = []
     private let queue = DispatchQueue(label: "contextmeter.usage")
     private let iso = ISO8601DateFormatter()
 
@@ -620,6 +623,7 @@ final class Usage {
     init() {
         iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         load()
+        shown = spend
     }
 
     // MARK: Reading
@@ -643,12 +647,16 @@ final class Usage {
     func refresh(_ accounts: [Account], done: @escaping () -> Void) {
         queue.async { [weak self] in
             guard let self else { return }
-            self.scan(accounts)
-            DispatchQueue.main.async(execute: done)
+            let (week, block) = self.scan(accounts)
+            let copy = self.spend
+            DispatchQueue.main.async {
+                self.shown = copy; self.weekCeiling = week; self.blockCeiling = block
+                done()
+            }
         }
     }
 
-    private func scan(_ accounts: [Account]) {
+    private func scan(_ accounts: [Account]) -> (week: Double, block: Double) {
         let horizon = Date().addingTimeInterval(-15 * 24 * 3600)
         let owners = accounts.count > 1 ? Account.owners(accounts) : [:]
         for root in Account.projectDirs(accounts) {
@@ -666,8 +674,8 @@ final class Usage {
         let cutoff = horizon.timeIntervalSince1970
         spend.removeAll { $0.at < cutoff }
         if seen.count > 400_000 { seen.removeAll() }   // offsets still guard against double counting
-        learnCeilings(accounts)
         save()
+        return learnCeilings(accounts)
     }
 
     private func read(_ url: URL, owner: String?) {
@@ -711,7 +719,7 @@ final class Usage {
     // MARK: Answering
 
     private func mine(_ account: String) -> [Spend] {
-        spend.filter { ($0.a ?? Account.main) == account }
+        shown.filter { ($0.a ?? Account.main) == account }
     }
 
     private func total(_ account: String, from: Date, to: Date = Date()) -> Double {
@@ -751,13 +759,13 @@ final class Usage {
     /// Every COMPLETED block and week in the fortnight, so the reference is
     /// your own worst case rather than a number somebody invented. A partial
     /// window in progress is never allowed to set the ceiling.
-    private func learnCeilings(_ accounts: [Account]) {
+    private func learnCeilings(_ accounts: [Account]) -> (week: Double, block: Double) {
         let week = 7.0 * 24 * 3600, block = blockHours * 3600
         var wk = 0.0, bl = 0.0
         for acct in accounts {
             var weeks: [Double: Double] = [:], blocks: [Double: Double] = [:]
             let anchor = weekAnchor(acct.id).timeIntervalSince1970
-            for s in mine(acct.id) {
+            for s in spend where (s.a ?? Account.main) == acct.id {
                 weeks[((s.at - anchor) / week).rounded(.down), default: 0] += s.cost
                 blocks[(s.at / block).rounded(.down), default: 0] += s.cost
             }
@@ -766,13 +774,12 @@ final class Usage {
             wk = max(wk, weeks.filter { $0.key != liveWeek }.values.max() ?? 0)
             bl = max(bl, blocks.filter { $0.key != liveBlock }.values.max() ?? 0)
         }
-        weekCeiling = wk
-        blockCeiling = bl
+        return (wk, bl)
     }
 
     func blockPct(_ account: String) -> Int? { blockCeiling > 0 ? Int((blockSpend(account) / blockCeiling * 100).rounded()) : nil }
     func weekPct(_ account: String) -> Int? { weekCeiling > 0 ? Int((weekSpend(account) / weekCeiling * 100).rounded()) : nil }
-    var hasHistory: Bool { !spend.isEmpty }
+    var hasHistory: Bool { !shown.isEmpty }
 }
 
 // MARK: - Opening a window
